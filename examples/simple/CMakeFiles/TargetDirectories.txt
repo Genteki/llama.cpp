@@ -1,0 +1,7 @@
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/llama-simple.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/edit_cache.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/rebuild_cache.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/list_install_components.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/install.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/install/local.dir
+/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/CMakeFiles/install/strip.dir

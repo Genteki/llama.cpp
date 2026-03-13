@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/genteki/gentekis_document/llama_cpp/llama.cpp/examples/simple/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

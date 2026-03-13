@@ -75,13 +75,6 @@ struct clip_hparams {
     int32_t audio_window_len  = -1;
     int32_t audio_hop_len     = -1;
 
-    // OpenVLA fused encoder (SigLIP) hparams
-    int32_t fused_n_embd = 0;
-    int32_t fused_n_ff = 0;
-    int32_t fused_n_head = 0;
-    int32_t fused_n_layer = 0;
-    float fused_eps = 1e-6;
-
     // legacy
     bool has_llava_projector = false;
     int minicpmv_version = 0;
@@ -352,14 +345,6 @@ struct clip_model {
     ggml_tensor * msfa_ffn_expand_bn = nullptr;
     ggml_tensor * msfa_ffn_project_bn = nullptr;
 
-
-    // OpenVLA fused encoder (second ViT, e.g. SigLIP)
-    std::vector<clip_layer> fused_layers;
-    ggml_tensor * fused_patch_embeddings = nullptr;
-    ggml_tensor * fused_position_embeddings = nullptr;
-    ggml_tensor * fused_post_ln_w = nullptr;
-    ggml_tensor * fused_post_ln_b = nullptr;
-    ggml_tensor * reg_embedding = nullptr;
 
     // pixtral, glm4v
     ggml_tensor * token_embd_img_break = nullptr;

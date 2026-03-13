@@ -107,9 +107,9 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
-    ctx_params.n_ctx = n_prompt + n_predict - 1;
+    ctx_params.n_ctx = n_prompt + n_predict - 1; // Question: why -1?
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch = n_prompt;
+    ctx_params.n_batch = n_prompt; // Question: why ?
     // enable performance counters
     ctx_params.no_perf = false;
 
@@ -121,7 +121,7 @@ int main(int argc, char ** argv) {
     }
 
     // initialize the sampler
-
+    // Question : What is sampler ?
     auto sparams = llama_sampler_chain_default_params();
     sparams.no_perf = false;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);

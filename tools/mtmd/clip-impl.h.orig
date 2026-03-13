@@ -43,11 +43,6 @@
 #define KEY_IMAGE_MEAN          "clip.vision.image_mean"
 #define KEY_IMAGE_STD           "clip.vision.image_std"
 #define KEY_FEATURE_LAYER       "clip.vision.feature_layer"
-#define KEY_FUSED_N_EMBD        "clip.vision.fused.embedding_length"
-#define KEY_FUSED_N_FF          "clip.vision.fused.feed_forward_length"
-#define KEY_FUSED_N_BLOCK       "clip.vision.fused.block_count"
-#define KEY_FUSED_N_HEAD        "clip.vision.fused.attention.head_count"
-#define KEY_FUSED_EPS           "clip.vision.fused.attention.layer_norm_epsilon"
 #define KEY_PROJ_SCALE_FACTOR   "clip.vision.projector.scale_factor"
 #define KEY_SPATIAL_MERGE_SIZE  "clip.vision.spatial_merge_size"
 #define KEY_IS_DEEPSTACK_LAYERS "clip.vision.is_deepstack_layers"
@@ -73,7 +68,6 @@
 
 #define TN_POS_EMBD        "%s.position_embd.weight"
 #define TN_CLASS_EMBD      "v.class_embd"
-#define TN_REG_EMBD        "v.reg_embd"
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backwrad compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
@@ -228,7 +222,6 @@ enum projector_type {
     PROJECTOR_TYPE_ULTRAVOX,
     PROJECTOR_TYPE_INTERNVL,
     PROJECTOR_TYPE_LLAMA4,
-    PROJECTOR_TYPE_OPENVLA,
     PROJECTOR_TYPE_QWEN2A,
     PROJECTOR_TYPE_GLMA,
     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
@@ -280,7 +273,6 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GLM4V,     "glm4v"},
     { PROJECTOR_TYPE_YOUTUVL,   "youtuvl"},
     { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
-    { PROJECTOR_TYPE_OPENVLA,  "openvla"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
 };
 

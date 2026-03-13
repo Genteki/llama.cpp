@@ -23,7 +23,6 @@ add_library(mtmd
             models/nemotron-v2-vl.cpp
             models/llama4.cpp
             models/llava.cpp
-            models/openvla.cpp
             models/minicpmv.cpp
             models/paddleocr.cpp
             models/pixtral.cpp

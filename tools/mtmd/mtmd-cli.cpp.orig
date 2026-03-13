@@ -81,7 +81,6 @@ struct mtmd_cli_context {
     common_chat_templates_ptr tmpls;
     std::vector<common_chat_msg> chat_history;
     bool use_jinja = false;
-    bool output_token_ids = false;
     // TODO: support for --system-prompt with /clear command
 
     // support for legacy templates (models not having EOT token)
@@ -115,7 +114,6 @@ struct mtmd_cli_context {
 
         tmpls = common_chat_templates_init(model, params.chat_template);
         use_jinja = params.use_jinja;
-        output_token_ids = params.output_token_ids;
         chat_history.clear();
         LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(tmpls.get(), params.use_jinja, params.default_template_kwargs).c_str());
 
@@ -193,12 +191,7 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             break; // end of generation
         }
 
-        if (ctx.output_token_ids) {
-            LOG("%d", token_id);
-            if (i < n_predict - 1) LOG(" ");
-        } else {
-            LOG("%s", common_token_to_piece(ctx.lctx, token_id).c_str());
-        }
+        LOG("%s", common_token_to_piece(ctx.lctx, token_id).c_str());
         fflush(stdout);
 
         if (g_is_interrupted) {

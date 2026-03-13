@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 4.2)
 set(TARGET llama-simple)
 add_executable(${TARGET} simple.cpp)
 install(TARGETS ${TARGET} RUNTIME)

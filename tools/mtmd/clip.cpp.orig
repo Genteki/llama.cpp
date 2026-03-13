@@ -853,10 +853,6 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_cogvlm>(ctx, img);
             } break;
-        case PROJECTOR_TYPE_OPENVLA:
-            {
-                builder = std::make_unique<clip_graph_openvla>(ctx, img);
-            } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_LDP:
@@ -1379,7 +1375,6 @@ struct clip_model_loader {
         };
 
         model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
-        model.reg_embedding   = get_tensor(TN_REG_EMBD,   false);
 
         model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
         model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
@@ -1498,51 +1493,6 @@ struct clip_model_loader {
                         model.proj_type = PROJECTOR_TYPE_MLP_NORM;
                     }
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
-                } break;
-            case PROJECTOR_TYPE_OPENVLA:
-                {
-                    // 3-layer MLP projector: mm.0, mm.2, mm.4
-                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
-                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
-                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
-                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
-                    model.mm_4_w = get_tensor(string_format(TN_LLAVA_PROJ, 4, "weight"));
-                    model.mm_4_b = get_tensor(string_format(TN_LLAVA_PROJ, 4, "bias"));
-
-                    // Fused encoder (SigLIP) model-level tensors
-                    model.fused_patch_embeddings    = get_tensor("v2.patch_embd.weight");
-                    model.fused_position_embeddings = get_tensor("v2.position_embd.weight");
-                    model.fused_post_ln_w = get_tensor("v2.post_ln.weight", false);
-                    model.fused_post_ln_b = get_tensor("v2.post_ln.bias",   false);
-
-                    // Fused encoder (SigLIP) layers
-                    {
-                        const int fused_n_layer = hparams.fused_n_layer;
-                        model.fused_layers.resize(fused_n_layer);
-                        for (int il = 0; il < fused_n_layer; ++il) {
-                            auto & layer = model.fused_layers[il];
-                            layer.k_w    = get_tensor(string_format(TN_ATTN_K,      "v2", il, "weight"), false);
-                            layer.q_w    = get_tensor(string_format(TN_ATTN_Q,      "v2", il, "weight"), false);
-                            layer.v_w    = get_tensor(string_format(TN_ATTN_V,      "v2", il, "weight"), false);
-                            layer.o_w    = get_tensor(string_format(TN_ATTN_OUTPUT, "v2", il, "weight"));
-                            layer.qkv_w  = get_tensor(string_format(TN_ATTN_QKV,    "v2", il, "weight"), false);
-                            layer.ln_1_w = get_tensor(string_format(TN_LN_1,        "v2", il, "weight"), false);
-                            layer.ln_2_w = get_tensor(string_format(TN_LN_2,        "v2", il, "weight"), false);
-                            layer.k_b    = get_tensor(string_format(TN_ATTN_K,      "v2", il, "bias"), false);
-                            layer.q_b    = get_tensor(string_format(TN_ATTN_Q,      "v2", il, "bias"), false);
-                            layer.v_b    = get_tensor(string_format(TN_ATTN_V,      "v2", il, "bias"), false);
-                            layer.o_b    = get_tensor(string_format(TN_ATTN_OUTPUT, "v2", il, "bias"), false);
-                            layer.qkv_b  = get_tensor(string_format(TN_ATTN_QKV,    "v2", il, "bias"), false);
-                            layer.ln_1_b = get_tensor(string_format(TN_LN_1,        "v2", il, "bias"), false);
-                            layer.ln_2_b = get_tensor(string_format(TN_LN_2,        "v2", il, "bias"), false);
-                            layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   "v2", il, "weight"));
-                            layer.ff_up_b   = get_tensor(string_format(TN_FFN_UP,   "v2", il, "bias"),   false);
-                            layer.ff_gate_w = get_tensor(string_format(TN_FFN_GATE, "v2", il, "weight"), false);
-                            layer.ff_gate_b = get_tensor(string_format(TN_FFN_GATE, "v2", il, "bias"),   false);
-                            layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, "v2", il, "weight"));
-                            layer.ff_down_b = get_tensor(string_format(TN_FFN_DOWN, "v2", il, "bias"),   false);
-                        }
-                    }
                 } break;
             case PROJECTOR_TYPE_LDP:
                 {
@@ -3430,7 +3380,6 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
     projector_type proj = ctx->proj_type();
 
     switch (proj) {
-        case PROJECTOR_TYPE_OPENVLA:
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
@@ -4063,8 +4012,6 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_model_block_1_block_2_1_b->ne[0];
         case PROJECTOR_TYPE_LDPV2:
             return ctx->model.mm_model_peg_0_b->ne[0];
-        case PROJECTOR_TYPE_OPENVLA:
-            return ctx->model.mm_4_b->ne[0];
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
