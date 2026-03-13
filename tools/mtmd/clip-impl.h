@@ -56,6 +56,15 @@
 #define KEY_MINICPMV_VERSION       "clip.minicpmv_version"
 #define KEY_MINICPMV_QUERY_NUM     "clip.minicpmv_query_num"
 
+// openvla fused (second) encoder
+#define KEY_FUSED_N_EMBD        "clip.vision.fused_embedding_length"
+#define KEY_FUSED_N_FF          "clip.vision.fused_feed_forward_length"
+#define KEY_FUSED_N_BLOCK       "clip.vision.fused_block_count"
+#define KEY_FUSED_N_HEAD        "clip.vision.fused_head_count"
+#define KEY_FUSED_IMG_MEAN      "clip.vision.fused_image_mean"
+#define KEY_FUSED_IMG_STD       "clip.vision.fused_image_std"
+#define KEY_FUSED_FEATURE_LAYER "clip.vision.fused_feature_layer"
+
 // audio-specific
 #define KEY_AUDIO_PROJ_TYPE     "clip.audio.projector_type" // for models with mixed modalities
 #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
@@ -71,6 +80,11 @@
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
+#define TN_REG_EMBD        "v.reg_embd"           // register tokens (DINO v2)
+
+// openvla second encoder (v2 prefix)
+#define TN_PATCH_EMBD_V2   "v2.patch_embd.weight"
+#define TN_PATCH_BIAS_V2   "v2.patch_embd.bias"
 #define TN_NORM_EMBD       "v.norm_embd.%s"
 #define TN_ATTN_QKV        "%s.blk.%d.attn_qkv.%s"
 #define TN_ATTN_K          "%s.blk.%d.attn_k.%s"
@@ -239,6 +253,7 @@ enum projector_type {
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_KIMIK25,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
+    PROJECTOR_TYPE_OPENVLA,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -276,6 +291,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_YOUTUVL,   "youtuvl"},
     { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
+    { PROJECTOR_TYPE_OPENVLA,        "openvla"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

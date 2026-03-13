@@ -826,6 +826,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_nemotron_v2_vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_OPENVLA:
+            {
+                builder = std::make_unique<clip_graph_openvla>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_LLAMA4:
             {
                 builder = std::make_unique<clip_graph_llama4>(ctx, img);
@@ -1284,6 +1288,32 @@ struct clip_model_loader {
                         hparams.audio_n_fft            = 512;
                         hparams.audio_window_len       = 400;
                         hparams.audio_hop_len          = 160;
+                    } break;
+                case PROJECTOR_TYPE_OPENVLA:
+                    {
+                        // fused (second) encoder params
+                        get_u32(KEY_FUSED_N_EMBD,  hparams.fused_n_embd);
+                        get_u32(KEY_FUSED_N_FF,    hparams.fused_n_ff);
+                        get_u32(KEY_FUSED_N_BLOCK, hparams.fused_n_layer);
+                        get_u32(KEY_FUSED_N_HEAD,  hparams.fused_n_head);
+                        {
+                            int idx_mean = gguf_find_key(ctx_gguf.get(), KEY_FUSED_IMG_MEAN);
+                            int idx_std  = gguf_find_key(ctx_gguf.get(), KEY_FUSED_IMG_STD);
+                            GGML_ASSERT(idx_mean >= 0 && "fused_image_mean not found");
+                            GGML_ASSERT(idx_std  >= 0 && "fused_image_std not found");
+                            const float * mean_data = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_mean);
+                            const float * std_data  = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_std);
+                            for (int i = 0; i < 3; ++i) {
+                                hparams.fused_image_mean[i] = mean_data[i];
+                                hparams.fused_image_std[i]  = std_data[i];
+                            }
+                        }
+                        {
+                            int idx = gguf_find_key(ctx_gguf.get(), KEY_FUSED_FEATURE_LAYER);
+                            if (idx >= 0) {
+                                hparams.fused_feature_layer = gguf_get_val_u32(ctx_gguf.get(), idx);
+                            }
+                        }
                     } break;
                 default:
                     break;
@@ -1809,6 +1839,48 @@ struct clip_model_loader {
                     model.mm_0_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 0, "weight"));
                     model.mm_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
                     model.mm_3_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 3, "weight"));
+                } break;
+            case PROJECTOR_TYPE_OPENVLA:
+                {
+                    // register tokens (DINO v2)
+                    model.reg_embedding = get_tensor(TN_REG_EMBD, false);
+
+                    // second encoder base tensors (SigLIP, v2 prefix)
+                    model.fused_patch_embeddings    = get_tensor(TN_PATCH_EMBD_V2);
+                    model.fused_patch_bias          = get_tensor(TN_PATCH_BIAS_V2, false);
+                    model.fused_position_embeddings = get_tensor(string_format(TN_POS_EMBD, "v2"));
+                    model.fused_post_ln_w           = get_tensor(string_format(TN_LN_POST, "v2", "weight"), false);
+                    model.fused_post_ln_b           = get_tensor(string_format(TN_LN_POST, "v2", "bias"), false);
+
+                    // second encoder layers
+                    model.fused_layers.resize(hparams.fused_n_layer);
+                    for (int il = 0; il < hparams.fused_n_layer; ++il) {
+                        auto & layer = model.fused_layers[il];
+                        layer.q_w    = get_tensor(string_format(TN_ATTN_Q, "v2", il, "weight"));
+                        layer.q_b    = get_tensor(string_format(TN_ATTN_Q, "v2", il, "bias"), false);
+                        layer.k_w    = get_tensor(string_format(TN_ATTN_K, "v2", il, "weight"));
+                        layer.k_b    = get_tensor(string_format(TN_ATTN_K, "v2", il, "bias"), false);
+                        layer.v_w    = get_tensor(string_format(TN_ATTN_V, "v2", il, "weight"));
+                        layer.v_b    = get_tensor(string_format(TN_ATTN_V, "v2", il, "bias"), false);
+                        layer.o_w    = get_tensor(string_format(TN_ATTN_OUTPUT, "v2", il, "weight"));
+                        layer.o_b    = get_tensor(string_format(TN_ATTN_OUTPUT, "v2", il, "bias"), false);
+                        layer.ln_1_w = get_tensor(string_format(TN_LN_1, "v2", il, "weight"));
+                        layer.ln_1_b = get_tensor(string_format(TN_LN_1, "v2", il, "bias"), false);
+                        layer.ln_2_w = get_tensor(string_format(TN_LN_2, "v2", il, "weight"));
+                        layer.ln_2_b = get_tensor(string_format(TN_LN_2, "v2", il, "bias"), false);
+                        layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   "v2", il, "weight"));
+                        layer.ff_up_b   = get_tensor(string_format(TN_FFN_UP,   "v2", il, "bias"), false);
+                        layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, "v2", il, "weight"));
+                        layer.ff_down_b = get_tensor(string_format(TN_FFN_DOWN, "v2", il, "bias"), false);
+                    }
+
+                    // projector: 3-layer MLP (fc1->GELU->fc2->GELU->fc3)
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.mm_4_w = get_tensor(string_format(TN_LLAVA_PROJ, 4, "weight"));
+                    model.mm_4_b = get_tensor(string_format(TN_LLAVA_PROJ, 4, "bias"));
                 } break;
             case PROJECTOR_TYPE_GLMA:
                 {
@@ -3150,6 +3222,35 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
+        case PROJECTOR_TYPE_OPENVLA:
+            {
+                // OpenVLA: dual encoder needs 6-channel image (DINO + SigLIP normalization)
+                clip_image_u8 resized_image;
+                int sz = params.image_size;
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BICUBIC);
+
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                img_f32->nx = resized_image.nx;
+                img_f32->ny = resized_image.ny;
+                img_f32->buf.resize(resized_image.nx * resized_image.ny * 6);
+
+                // Fill 6 channels: first 3 = DINO normalized, next 3 = SigLIP normalized
+                for (int y = 0; y < resized_image.ny; y++) {
+                    for (int x = 0; x < resized_image.nx; x++) {
+                        size_t src_idx = 3 * (y * resized_image.nx + x);
+                        size_t dst_idx = 6 * (y * resized_image.nx + x);
+                        for (int c = 0; c < 3; c++) {
+                            float val = static_cast<float>(resized_image.buf[src_idx + c]) / 255.0f;
+                            // DINO normalization (channels 0-2)
+                            img_f32->buf[dst_idx + c]     = (val - params.image_mean[c]) / params.image_std[c];
+                            // SigLIP normalization (channels 3-5)
+                            img_f32->buf[dst_idx + 3 + c] = (val - params.fused_image_mean[c]) / params.fused_image_std[c];
+                        }
+                    }
+                }
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+
         case PROJECTOR_TYPE_GEMMA3NV:
             {
                 clip_image_u8 resized_image;
@@ -3400,6 +3501,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
+        case PROJECTOR_TYPE_OPENVLA:
             {
                 // do nothing
             } break;
@@ -3613,9 +3715,12 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // set input pixel values
     if (!imgs.is_audio) {
+        const bool is_6ch = (ctx->model.proj_type == PROJECTOR_TYPE_OPENVLA);
+        const int n_channels = is_6ch ? 6 : 3;
+
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
+            nelem += img->nx * img->ny * n_channels;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3629,6 +3734,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // │     H │  channel = B
         // └─────┘ │
         //   ──────┘ x B
+        // (for 6-channel models, add 3 more channel planes)
 
         for (size_t i = 0; i < imgs.entries.size(); i++) {
             const int nx = imgs.entries[i]->nx;
@@ -3636,14 +3742,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             const int n = nx * ny;
 
             for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
+                float * batch_entry = inp_raw.data() + b * (n_channels * n);
                 for (int y = 0; y < ny; y++) {
                     for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
+                        size_t base_src = n_channels * (y * nx + x);
+                        size_t base_dst =              y * nx + x;
+                        for (int c = 0; c < n_channels; c++) {
+                            batch_entry[c*n + base_dst] = imgs.entries[b]->buf[base_src + c];
+                        }
                     }
                 }
             }
@@ -3903,6 +4009,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
         case PROJECTOR_TYPE_COGVLM:
+        case PROJECTOR_TYPE_OPENVLA:
             {
                 // do nothing
             } break;
@@ -4061,6 +4168,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
             return ctx->model.mm_3_w->ne[1];
+        case PROJECTOR_TYPE_OPENVLA:
+            return ctx->model.mm_4_w->ne[1];
         case PROJECTOR_TYPE_LLAMA4:
             return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_QWEN2A:

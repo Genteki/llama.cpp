@@ -75,6 +75,15 @@ struct clip_hparams {
     int32_t audio_window_len  = -1;
     int32_t audio_hop_len     = -1;
 
+    // openvla fused (second) encoder
+    int32_t fused_n_embd  = 0;
+    int32_t fused_n_ff    = 0;
+    int32_t fused_n_head  = 0;
+    int32_t fused_n_layer = 0;
+    float fused_image_mean[3] = {0};
+    float fused_image_std[3]  = {0};
+    int32_t fused_feature_layer = -1;
+
     // legacy
     bool has_llava_projector = false;
     int minicpmv_version = 0;
@@ -258,6 +267,17 @@ struct clip_model {
     ggml_tensor * mm_2_b = nullptr;
 
     ggml_tensor * image_newline = nullptr;
+
+    // openvla: register tokens (DINO v2)
+    ggml_tensor * reg_embedding = nullptr;
+
+    // openvla: second vision encoder (SigLIP)
+    ggml_tensor * fused_patch_embeddings    = nullptr;
+    ggml_tensor * fused_patch_bias          = nullptr;
+    ggml_tensor * fused_position_embeddings = nullptr;
+    ggml_tensor * fused_post_ln_w = nullptr;
+    ggml_tensor * fused_post_ln_b = nullptr;
+    std::vector<clip_layer> fused_layers;
 
     // Yi type models with mlp+normalization projection
     ggml_tensor * mm_1_w = nullptr; // Yi type models have 0, 1, 3, 4
