@@ -83,6 +83,11 @@ ggml_cgraph * clip_graph_siglip::build() {
             FFN_GELU,
             -1);
 
+    } else if (proj_type == PROJECTOR_TYPE_PI0) {
+        // PI0: simple linear projection 1152 -> 2048
+        cur = ggml_mul_mat(ctx0, model.mm_0_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_0_b);
+
     } else {
         GGML_ABORT("SigLIP: Unsupported projector type");
     }
