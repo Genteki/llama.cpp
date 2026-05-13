@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -8209,6 +8211,52 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // True-QJL FA path for Q3J1_TQ K/V — bypasses K reconstruction by precomputing
+    // Sq = S·q per Q row, then doing q·k ≈ q·codebook + corr_scale·<Sq, sign(Sk)>
+    // per K row. V uses codebook-only dequant (the 1-bit residual doesn't pay back
+    // for V since it's not in a dot product). Toggle: env Q3J1_TQ_USE_FA=1.
+    const bool use_qjl_fa = (k->type == GGML_TYPE_Q3J1_TQ) && q3j1_tq_should_use_fa();
+    float Sq_buffer[512]; // sized for DK ≤ 512 (PI0 has DK = 256)
+    GGML_ASSERT(!use_qjl_fa || DK <= 512);
+    GGML_ASSERT(!use_qjl_fa || v->type == GGML_TYPE_Q3J1_TQ);
+
+    // Pre-dequant K/V experiment: dequantize K and V to fp32 once at the top of
+    // this thread's chunk and reuse across all Q rows. Solves the 408× redundancy
+    // where _one_chunk re-dequants each K row once per Q-row visit (Q rows are
+    // independent in QK^T so the dequants produce identical fp32 vectors).
+    // Toggle: env Q3J1_TQ_PRE_DEQUANT_KV=1.
+    static int q3j1_tq_pre_dequant_cached = -1;
+    if (q3j1_tq_pre_dequant_cached < 0) {
+        const char * e = getenv("Q3J1_TQ_PRE_DEQUANT_KV");
+        q3j1_tq_pre_dequant_cached = (e && atoi(e) > 0) ? 1 : 0;
+    }
+    const bool pre_dequant_kv = q3j1_tq_pre_dequant_cached
+                              && (k->type == GGML_TYPE_Q3J1_TQ)
+                              && (v->type == GGML_TYPE_Q3J1_TQ)
+                              && !use_qjl_fa;
+    std::vector<float> K_dq_buf;
+    std::vector<float> V_dq_buf;
+    int64_t pre_dq_ik2 = -1, pre_dq_ik3 = -1, pre_dq_iv2 = -1, pre_dq_iv3 = -1;
+    if (pre_dequant_kv && ir0 < ir1) {
+        // Use the first Q row's KV indices. PI0 has all Q rows in this chunk
+        // sharing (ik2, ik3, iv2, iv3) since neq3=1, nek2=1; assert below.
+        const int iq3_first = ir0/(neq2*neq1);
+        const int iq2_first = (ir0 - iq3_first*neq2*neq1)/neq1;
+        pre_dq_ik2 = iq2_first / rk2;
+        pre_dq_ik3 = iq3_first / rk3;
+        pre_dq_iv2 = iq2_first / rv2;
+        pre_dq_iv3 = iq3_first / rv3;
+
+        K_dq_buf.resize((size_t) nek1 * DK);
+        V_dq_buf.resize((size_t) nek1 * DV);
+        for (int64_t ic = 0; ic < nek1; ic++) {
+            const char * k_data = (const char *) k->data + ( ic*nbk1 + pre_dq_ik2*nbk2 + pre_dq_ik3*nbk3);
+            const char * v_data = (const char *) v->data + ( ic*nbv1 + pre_dq_iv2*nbv2 + pre_dq_iv3*nbv3);
+            dequantize_row_q3j1_tq((const block_q3j1_tq *) k_data, K_dq_buf.data() + ic*DK, DK);
+            dequantize_row_q3j1_tq((const block_q3j1_tq *) v_data, V_dq_buf.data() + ic*DV, DV);
+        }
+    }
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -8247,6 +8295,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
 
+        // QJL-FA: precompute Sq once per Q row, reused across all K rows.
+        if (use_qjl_fa) {
+            ggml_q3j1_tq_precompute_Sq(DK, pq, Sq_buffer);
+        }
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -8260,7 +8313,17 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (use_qjl_fa) {
+                ggml_vec_dot_q3j1_tq_qjl_fa(DK, &s, (const block_q3j1_tq *) k_data, pq, Sq_buffer);
+            } else if (pre_dequant_kv) {
+                GGML_ASSERT(ik2 == pre_dq_ik2 && ik3 == pre_dq_ik3 && "pre_dequant_kv: KV head index varies in chunk; only PI0-style uniform chunks supported");
+                const float * k_fp32 = K_dq_buf.data() + ic * DK;
+                float acc = 0.0f;
+                for (int64_t j = 0; j < DK; j++) acc += pq[j] * k_fp32[j];
+                s = acc;
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8306,7 +8369,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (use_qjl_fa) {
+                    // Codebook-only V: drops the 1-bit residual (V doesn't benefit from QJL).
+                    dequantize_row_q3j1_tq_codebook((const block_q3j1_tq *) v_data, V32, DV);
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (pre_dequant_kv) {
+                    GGML_ASSERT(iv2 == pre_dq_iv2 && iv3 == pre_dq_iv3);
+                    const float * v_fp32 = V_dq_buf.data() + ic * DV;
+                    ggml_vec_mad_f32(DV, VKQ32, v_fp32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {

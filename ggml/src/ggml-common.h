@@ -177,6 +177,22 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+#define QK_GENTEKI_Q3J1 32
+typedef struct {
+    ggml_half d;       // primary scale (correction subscale implicit = d/8)
+    uint8_t   qs[12];  // 32 x 3-bit primary codes: qs[0..7]=low 2 bits, qs[8..11]=high 1 bit
+    uint8_t   cs[4];   // 32 x 1-bit sign-of-residual correction
+} block_genteki_q3j1;
+static_assert(sizeof(block_genteki_q3j1) == sizeof(ggml_half) + 12 + 4, "wrong genteki_q3j1 block size/padding");
+
+#define QK_Q3J1_TQ 32
+typedef struct {
+    ggml_half d;       // per-block scale: d = max|x| / max codebook level
+    uint8_t   qs[12];  // 32 x 3-bit codebook indices (TurboQuant; codebook = N(0,1) Lloyd-Max)
+    uint8_t   cs[4];   // 32 x 1-bit signs from QJL projection of residual: sign(S * r)
+} block_q3j1_tq;
+static_assert(sizeof(block_q3j1_tq) == sizeof(ggml_half) + 12 + 4, "wrong q3j1_tq block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

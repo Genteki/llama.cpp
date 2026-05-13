@@ -227,6 +227,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_GENTEKI_Q4_0] = {
+        .from_float               = quantize_row_q4_0,
+        .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3J1_TQ] = {
+        .from_float               = quantize_row_q3j1_tq,
+        .vec_dot                  = ggml_vec_dot_q3j1_tq_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_GENTEKI_Q3J1] = {
+        .from_float               = quantize_row_genteki_q3j1,
+        .vec_dot                  = ggml_vec_dot_genteki_q3j1_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_1] = {
         .from_float               = quantize_row_q4_1,
         .vec_dot                  = ggml_vec_dot_q4_1_q8_1,

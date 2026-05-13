@@ -33,6 +33,9 @@ struct quant_option {
 
 static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
+    { "GENTEKI_Q4_0", LLAMA_FTYPE_MOSTLY_GENTEKI_Q4_0, "genteki custom 4-bit (clone of Q4_0)", },
+    { "GENTEKI_Q3J1", LLAMA_FTYPE_MOSTLY_GENTEKI_Q3J1, "genteki 3-bit + 1-bit sign-of-residual, 4.5 bpw", },
+    { "Q3J1_TQ",      LLAMA_FTYPE_MOSTLY_Q3J1_TQ,      "TurboQuant 3-bit codebook + 1-bit QJL, 4.5 bpw", },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },

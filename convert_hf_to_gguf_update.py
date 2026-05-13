@@ -24,7 +24,6 @@ convert_py = convert_py_pth.read_text(encoding="utf-8")
 hf_token_pth = pathlib.Path.home() / ".cache" / "huggingface" / "token"
 hf_token = hf_token_pth.read_text(encoding="utf-8").strip() if hf_token_pth.exists() else None
 
-
 class TOKENIZER_TYPE(IntEnum):
     SPM = auto()
     BPE = auto()

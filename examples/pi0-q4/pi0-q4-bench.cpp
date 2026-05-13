@@ -3,31 +3,18 @@
 // Usage:
 //   llama-pi0-bench -m <model_dir> --image img.jpg -p "instruction" [-n 100] [--warmup 5]
 
-#include "pi0-common.h"
-
-#include "arg.h"
-#include "log.h"
-#include "common.h"
-#include "llama.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
-#include "ggml.h"
+#include "pi0-q4-common.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
 #include <numeric>
-#include <random>
-#include <string>
-#include <vector>
 
 // ---- Timing infrastructure ----
 
 enum Phase {
     PHASE_VISION_ENCODE,
     PHASE_PREFIX_PASS,
+    PHASE_SUFFIX_PREP,
     PHASE_EXPERT_STEP,
     PHASE_DIFFUSION_TOTAL,
     PHASE_INFERENCE_TOTAL,
@@ -37,7 +24,8 @@ enum Phase {
 static const char * phase_names[PHASE_COUNT] = {
     "Vision Encode",
     "Prefix Pass",
-    "Expert Step (x10)", // suffix prep is folded into the expert graph
+    "Suffix Prep (x10)",
+    "Expert Step (x10)",
     "Diffusion Total",
     "Inference Total",
 };
@@ -123,20 +111,15 @@ static bench_params strip_bench_args(int & argc, char ** argv) {
 // ---- Main ----
 
 int main(int argc, char ** argv) {
-    // Strip shared pi0 flags (--backend) first, then bench-specific ones.
-    pi0_cli      cli = pi0_strip_cli_args(argc, argv);
-    bench_params bp  = strip_bench_args(argc, argv);
+    bench_params bp = strip_bench_args(argc, argv);
     common_params params;
 
     auto show_help = [](int, char ** argv) {
         printf("PI0 benchmark — per-phase timing\n\n");
         printf("Usage: %s -m <model_dir> --image img1.jpg,img2.jpg,img3.jpg \\\n", argv[0]);
-        printf("         -p <instruction> [-n 100] [--warmup 5] [--backend cpu|auto|<name>]\n");
-        printf("         [--kv-type f32|f16|q8_0|q4_0]\n\n");
+        printf("         -p <instruction> [-n 100] [--warmup 5]\n\n");
         printf("  -n <int>       Number of benchmark iterations (default: 100)\n");
         printf("  --warmup <int> Warmup iterations (default: 5)\n");
-        printf("  --backend      Backend: 'cpu' (default), 'auto'/'gpu', or a concrete name.\n");
-        printf("  --kv-type      KV cache element type: f32 (default), f16, q8_0, q4_0, ...\n");
         printf("\nNote: use comma-separated paths for --image (not repeated flags)\n");
     };
 
@@ -164,9 +147,9 @@ int main(int argc, char ** argv) {
 
     // ---- Initialize (one-time) ----
 
-    ggml_backend_t backend = pi0_init_backend(cli.backend);
+    ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
-        LOG_ERR("Failed to init backend '%s'\n", cli.backend.c_str());
+        LOG_ERR("Failed to init CPU backend\n");
         return 1;
     }
 
@@ -175,7 +158,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("Failed to load PI0 model\n");
         return 1;
     }
-    pi0_dump_tensor_types(model);
 
     auto llama_init = common_init_from_params(params);
     llama_model   * llm_model = llama_init->model();
@@ -226,18 +208,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Per-row dequant via embd_lookup_f32 — no full-table dequant needed.
-    const int n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
-    std::vector<float> emb_row(PALI_N_EMBD);
+    // Pre-load embedding table (one-time)
+    std::vector<float> embd_table(ggml_nelements(model.pali_embed));
+    tensor_to_f32(model.pali_embed, embd_table.data());
 
-    // Per-inference state (KV cache lives on the backend; reused across iterations).
-    pi0_session session;
-    session.kv_type = pi0_ggml_type_from_string(cli.kv_type);
-    if (session.kv_type == GGML_TYPE_COUNT) {
-        LOG_ERR("Unknown --kv-type '%s' (try f32, f16, q8_0, q4_0)\n", cli.kv_type.c_str());
-        return 1;
-    }
-    LOG_INF("KV cache type: %s\n", ggml_type_name(session.kv_type));
+    // Identify image chunks for re-encoding
+    const int n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
 
     // Robot state (zeros)
     std::vector<float> robot_state(PI0_ACTION_DIM, 0.0f);
@@ -272,8 +248,8 @@ int main(int argc, char ** argv) {
                 size_t n_tokens = 0;
                 const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
                 for (size_t t = 0; t < n_tokens; t++) {
-                    embd_lookup_f32(model.pali_embed, tokens[t], emb_row.data());
-                    prefix_embeddings.insert(prefix_embeddings.end(), emb_row.begin(), emb_row.end());
+                    const float * emb = &embd_table[(size_t)tokens[t] * PALI_N_EMBD];
+                    prefix_embeddings.insert(prefix_embeddings.end(), emb, emb + PALI_N_EMBD);
                     actual_prefix_len++;
                 }
             } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
@@ -292,7 +268,7 @@ int main(int argc, char ** argv) {
         int64_t t1 = ggml_time_us();
 
         // ---- Phase: Prefix Pass ----
-        if (!run_paligemma_prefix(model, session, backend, prefix_embeddings.data(), actual_prefix_len)) {
+        if (!run_paligemma_prefix_v2(model, backend, prefix_embeddings.data(), actual_prefix_len)) {
             LOG_ERR("Prefix pass failed at run %d\n", run);
             return 1;
         }
@@ -305,21 +281,29 @@ int main(int argc, char ** argv) {
         std::vector<float> x_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
         for (auto & v : x_t) v = normal(rng);
 
+        double suffix_prep_ms = 0.0;
         double expert_step_ms = 0.0;
-        std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
 
         for (int step = 0; step < PI0_NUM_STEPS; step++) {
             float t = 1.0f + step * dt;
 
+            // Suffix prep
             int64_t ts0 = ggml_time_us();
-            if (!run_expert_step(model, session, backend,
-                                 robot_state.data(), x_t.data(), t, v_t.data())) {
+            std::vector<float> suffix_emb(EXPERT_N_EMBD * (PI0_ACTION_HORIZON + 1));
+            prepare_suffix(model, robot_state.data(), x_t.data(), t, suffix_emb.data());
+            int64_t ts1 = ggml_time_us();
+            suffix_prep_ms += (ts1 - ts0) / 1000.0;
+
+            // Expert step
+            std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
+            if (!run_expert_step(model, backend, suffix_emb.data(), v_t.data())) {
                 LOG_ERR("Expert step failed at run %d step %d\n", run, step);
                 return 1;
             }
-            int64_t ts1 = ggml_time_us();
-            expert_step_ms += (ts1 - ts0) / 1000.0;
+            int64_t ts2 = ggml_time_us();
+            expert_step_ms += (ts2 - ts1) / 1000.0;
 
+            // Euler update
             for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
                 x_t[i] += dt * v_t[i];
             }
@@ -336,6 +320,7 @@ int main(int argc, char ** argv) {
 
             stats[PHASE_VISION_ENCODE].samples_ms.push_back(vision_ms);
             stats[PHASE_PREFIX_PASS].samples_ms.push_back(prefix_ms);
+            stats[PHASE_SUFFIX_PREP].samples_ms.push_back(suffix_prep_ms);
             stats[PHASE_EXPERT_STEP].samples_ms.push_back(expert_step_ms);
             stats[PHASE_DIFFUSION_TOTAL].samples_ms.push_back(diff_ms);
             stats[PHASE_INFERENCE_TOTAL].samples_ms.push_back(total_ms);
@@ -352,8 +337,10 @@ int main(int argc, char ** argv) {
     print_table(stats, bp.n_iter, bp.n_warmup);
 
     // Cleanup
-    pi0_session_free(session);
-    free_pi0_model(model);
+    if (model.buf_pali)   ggml_backend_buffer_free(model.buf_pali);
+    if (model.buf_expert) ggml_backend_buffer_free(model.buf_expert);
+    if (model.ctx_pali)   ggml_free(model.ctx_pali);
+    if (model.ctx_expert) ggml_free(model.ctx_expert);
     ggml_backend_free(backend);
 
     return 0;

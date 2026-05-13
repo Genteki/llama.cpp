@@ -1993,6 +1993,376 @@ size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// ===== GENTEKI_Q3J1: 3-bit primary + 1-bit sign-of-residual correction =====
+//
+// Per block of 32 elements:
+//   d  : fp16 primary scale, set so x / d in [-3.75, +3.75]
+//   q  : 3-bit code in [0,7],  primary dequant = d * (q - 3.5)
+//   c  : 1-bit sign of residual,  correction = (d/4) * (c ? +1 : -1)
+// Effective representable grid: d * { (q - 3.5) + 0.25 * (2c-1) } for q=0..7, c=0/1
+// which gives 16 levels per block at step d/2, total 4.5 bpw (18 B / 32 elems).
+
+void quantize_row_genteki_q3j1_ref(const float * GGML_RESTRICT x, block_genteki_q3j1 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_GENTEKI_Q3J1;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (v > amax) amax = v;
+        }
+
+        const float d  = amax / 3.75f;              // leave 0.25 headroom for correction subscale
+        const float id = d ? 1.0f/d : 0.0f;
+        const float dc = d * 0.25f;                 // correction subscale
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, 12);
+        memset(y[i].cs, 0, 4);
+
+        for (int j = 0; j < qk; j++) {
+            const float xj = x[i*qk + j];
+            // round(x/d + 3.5) clamped to [0,7]
+            int q = (int)floorf(xj * id + 3.5f + 0.5f);
+            if (q < 0) q = 0;
+            if (q > 7) q = 7;
+
+            // pack: qs[0..7] hold low 2 bits, qs[8..11] hold high 1 bit
+            const uint8_t lo2 = (uint8_t)(q & 0x3);
+            const uint8_t hi1 = (uint8_t)((q >> 2) & 0x1);
+            y[i].qs[j >> 2]       |= (uint8_t)(lo2 << (2 * (j & 0x3)));
+            y[i].qs[8 + (j >> 3)] |= (uint8_t)(hi1 << (j & 0x7));
+
+            // 1-bit correction: c=1 picks (+dc), c=0 picks (-dc). Optimal if sign(residual) is chosen.
+            const float q_val = d * ((float)q - 3.5f);
+            if (xj >= q_val) {
+                y[i].cs[j >> 3] |= (uint8_t)(1u << (j & 0x7));
+            }
+            (void)dc;
+        }
+    }
+}
+
+void dequantize_row_genteki_q3j1(const block_genteki_q3j1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_GENTEKI_Q3J1;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = GGML_FP16_TO_FP32(x[i].d);
+        const float dc = d * 0.25f;
+
+        for (int j = 0; j < qk; j++) {
+            const uint8_t lo2 = (x[i].qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+            const uint8_t hi1 = (x[i].qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+            const int q = (int)((hi1 << 2) | lo2);
+            const float c = ((x[i].cs[j >> 3] >> (j & 0x7)) & 0x1) ? +1.0f : -1.0f;
+            y[i*qk + j] = d * ((float)q - 3.5f) + dc * c;
+        }
+    }
+}
+
+size_t quantize_genteki_q3j1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // no imatrix path yet
+    quantize_row_genteki_q3j1_ref(src, (block_genteki_q3j1 *)dst, (int64_t)nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_GENTEKI_Q3J1, n_per_row);
+}
+
+// ===== Q3J1_TQ: TurboQuant 3-bit codebook + 1-bit QJL =====
+//
+// Per block of 32 elements:
+//   d  : fp16 per-block scale, set so x/d in [-Lmax, +Lmax] where Lmax = max codebook level
+//   q  : 3-bit codebook index (0..7),  primary dequant = d * codebook[q]
+//   c  : 1-bit sign of (S * residual),  S = fixed 32x32 N(0, 1/sqrt(32)) projection
+// Codebook: 8-level Lloyd-Max optimal for N(0,1) — fixed table, not data-dependent.
+// QJL bits: real Johnson-Lindenstrauss random projection of residual r = x - d*codebook[q].
+//
+// The QJL bits are designed for *dot-product* preservation, not vector reconstruction;
+// to_float reconstructs a best-effort residual via S^T * sign_vector with calibrated scale.
+
+static const float q3j1_tq_codebook[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+static const float q3j1_tq_codebook_max = 2.1519f;
+
+#define Q3J1_TQ_S_DIM 32
+
+// Fixed 32x32 Gaussian projection. Lazily initialized from a deterministic seed
+// (Box-Muller from a 64-bit LCG). The race on init is benign: every thread that
+// computes init writes the same bytes; subsequent reads see the deterministic matrix.
+static float q3j1_tq_S[Q3J1_TQ_S_DIM * Q3J1_TQ_S_DIM];
+static volatile int q3j1_tq_S_inited = 0;
+
+static void q3j1_tq_init_S(void) {
+    if (q3j1_tq_S_inited) return;
+    uint64_t state = 0x42424242ULL;
+    const float scale = 1.0f / sqrtf((float)Q3J1_TQ_S_DIM);
+    const int N = Q3J1_TQ_S_DIM * Q3J1_TQ_S_DIM;
+    for (int i = 0; i < N; i += 2) {
+        // 64-bit LCG (Numerical Recipes constants)
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint32_t a = (uint32_t)(state >> 32);
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint32_t b = (uint32_t)(state >> 32);
+        // Map to (0, 1] for u1 (avoid log(0)) and [0, 1) for u2.
+        float u1 = (a == 0) ? (1.0f / 4294967296.0f) : (float)a * (1.0f / 4294967296.0f);
+        float u2 = (float)b * (1.0f / 4294967296.0f);
+        float r = sqrtf(-2.0f * logf(u1));
+        float theta = 2.0f * (float)M_PI * u2;
+        q3j1_tq_S[i] = r * cosf(theta) * scale;
+        if (i + 1 < N) {
+            q3j1_tq_S[i + 1] = r * sinf(theta) * scale;
+        }
+    }
+    q3j1_tq_S_inited = 1;
+}
+
+void quantize_row_q3j1_tq_ref(const float * GGML_RESTRICT x, block_q3j1_tq * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_Q3J1_TQ;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    q3j1_tq_init_S();
+
+    for (int i = 0; i < nb; i++) {
+        // Per-block scale so max |x|/d == Lmax
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (v > amax) amax = v;
+        }
+        const float d  = amax / q3j1_tq_codebook_max;
+        const float id = d ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, 12);
+        memset(y[i].cs, 0, 4);
+
+        // 3-bit codebook quantization + residual collection
+        float r[Q3J1_TQ_S_DIM];
+        for (int j = 0; j < qk; j++) {
+            const float xj = x[i*qk + j];
+            const float xn = xj * id;
+
+            // Find argmin index over 8 levels (small enough that linear search is fine)
+            int best_q = 0;
+            float best_diff = fabsf(xn - q3j1_tq_codebook[0]);
+            for (int q = 1; q < 8; q++) {
+                float diff = fabsf(xn - q3j1_tq_codebook[q]);
+                if (diff < best_diff) { best_diff = diff; best_q = q; }
+            }
+
+            // Pack: qs[0..7] hold low 2 bits, qs[8..11] hold high 1 bit
+            const uint8_t lo2 = (uint8_t)(best_q & 0x3);
+            const uint8_t hi1 = (uint8_t)((best_q >> 2) & 0x1);
+            y[i].qs[j >> 2]       |= (uint8_t)(lo2 << (2 * (j & 0x3)));
+            y[i].qs[8 + (j >> 3)] |= (uint8_t)(hi1 << (j & 0x7));
+
+            r[j] = xj - d * q3j1_tq_codebook[best_q];
+        }
+
+        // QJL projection: cs_m = sign(sum_j S[m, j] * r[j]).
+        // 32x32 multiply-add per block — the dominant compute of this quant.
+        for (int m = 0; m < Q3J1_TQ_S_DIM; m++) {
+            float z = 0.0f;
+            const float * Srow = &q3j1_tq_S[m * Q3J1_TQ_S_DIM];
+            for (int j = 0; j < Q3J1_TQ_S_DIM; j++) {
+                z += Srow[j] * r[j];
+            }
+            if (z >= 0.0f) {
+                y[i].cs[m >> 3] |= (uint8_t)(1u << (m & 0x7));
+            }
+        }
+    }
+}
+
+// Env-var toggle for the QJL Sᵀ·sign reconstruction in to_float.
+// Set Q3J1_TQ_SKIP_QJL=1 to fall back to pure codebook lookup (drops the 1-bit
+// residual correction). Used to isolate the QJL contribution to dequant cost.
+static int q3j1_tq_skip_qjl_cached = -1;
+int q3j1_tq_should_skip_qjl(void) {
+    if (q3j1_tq_skip_qjl_cached < 0) {
+        const char * e = getenv("Q3J1_TQ_SKIP_QJL");
+        q3j1_tq_skip_qjl_cached = (e && atoi(e) > 0) ? 1 : 0;
+    }
+    return q3j1_tq_skip_qjl_cached;
+}
+
+// Accessors so SIMD code in libggml-cpu (which has -mavx2 -mfma) can reach the
+// static codebook and projection matrix without duplicating the data.
+const float * q3j1_tq_get_codebook(void) {
+    return q3j1_tq_codebook;
+}
+const float * q3j1_tq_get_S(void) {
+    q3j1_tq_init_S();
+    return q3j1_tq_S;
+}
+int q3j1_tq_get_S_dim(void) {
+    return Q3J1_TQ_S_DIM;
+}
+
+void dequantize_row_q3j1_tq(const block_q3j1_tq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_Q3J1_TQ;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    q3j1_tq_init_S();
+    const int skip_qjl = q3j1_tq_should_skip_qjl();
+
+    // Calibrated reconstruction scale:
+    //   ||r||/d on N(0,1) input with 8-level Lloyd-Max ≈ sqrt(qk * 0.0345) ≈ 1.05
+    //   JL recovery formula: r̂ ≈ S^T * sign(Sr) * (||r|| * sqrt(π/2) / m)
+    //   With m = qk = 32 and ||r||/d ≈ 1.05:
+    const float qjl_recovery_scale = 1.05f * sqrtf((float)M_PI / 2.0f) / (float)Q3J1_TQ_S_DIM;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        if (skip_qjl) {
+            // Codebook-only path: skip the 32x32 Sᵀ·sign reconstruction.
+            for (int j = 0; j < qk; j++) {
+                const uint8_t lo2 = (x[i].qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+                const uint8_t hi1 = (x[i].qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+                const int q = (int)((hi1 << 2) | lo2);
+                y[i*qk + j] = d * q3j1_tq_codebook[q];
+            }
+        } else {
+            const float corr_scale = d * qjl_recovery_scale;
+
+            // Decode signs into a +/-1 vector once
+            float signs[Q3J1_TQ_S_DIM];
+            for (int m = 0; m < Q3J1_TQ_S_DIM; m++) {
+                signs[m] = ((x[i].cs[m >> 3] >> (m & 0x7)) & 0x1) ? +1.0f : -1.0f;
+            }
+
+            for (int j = 0; j < qk; j++) {
+                const uint8_t lo2 = (x[i].qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+                const uint8_t hi1 = (x[i].qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+                const int q = (int)((hi1 << 2) | lo2);
+
+                // Best-effort residual recovery: corr_j = corr_scale * sum_m S[m, j] * signs[m]
+                float corr = 0.0f;
+                for (int m = 0; m < Q3J1_TQ_S_DIM; m++) {
+                    corr += q3j1_tq_S[m * Q3J1_TQ_S_DIM + j] * signs[m];
+                }
+                y[i*qk + j] = d * q3j1_tq_codebook[q] + corr_scale * corr;
+            }
+        }
+    }
+}
+
+size_t quantize_q3j1_tq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    quantize_row_q3j1_tq_ref(src, (block_q3j1_tq *)dst, (int64_t)nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q3J1_TQ, n_per_row);
+}
+
+// Codebook-only dequant — drops the QJL Sᵀ·sign reconstruction. Used as V
+// to_float in the true-QJL FA path (V doesn't benefit from QJL since it's not
+// in a dot product, only summed via softmax weights).
+void dequantize_row_q3j1_tq_codebook(const block_q3j1_tq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_Q3J1_TQ;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; j++) {
+            const uint8_t lo2 = (x[i].qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+            const uint8_t hi1 = (x[i].qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+            const int q = (int)((hi1 << 2) | lo2);
+            y[i*qk + j] = d * q3j1_tq_codebook[q];
+        }
+    }
+}
+
+// Env-var toggle for the QJL-aware flash-attn path.
+// Set Q3J1_TQ_USE_FA=1 to dispatch the true-QJL FA inner loop in
+// ggml_compute_forward_flash_attn_ext_f16_one_chunk for Q3J1_TQ K/V tensors.
+static int q3j1_tq_use_fa_cached = -1;
+int q3j1_tq_should_use_fa(void) {
+    if (q3j1_tq_use_fa_cached < 0) {
+        const char * e = getenv("Q3J1_TQ_USE_FA");
+        q3j1_tq_use_fa_cached = (e && atoi(e) > 0) ? 1 : 0;
+    }
+    return q3j1_tq_use_fa_cached;
+}
+
+// Precompute Sq = S · q_block for each block of the Q row.
+// q: [n] fp32, n must be multiple of 32.
+// Sq_out: [n] fp32 (same size as q): Sq_out[b*32 + m] = sum_j q[b*32+j] * S[m, j].
+// One 32×32 matvec per block. ~1024 FLOPs per block, computed once per Q row.
+void ggml_q3j1_tq_precompute_Sq(int n, const float * GGML_RESTRICT q, float * GGML_RESTRICT Sq_out) {
+    assert(n % Q3J1_TQ_S_DIM == 0);
+    q3j1_tq_init_S();
+    const int nb = n / Q3J1_TQ_S_DIM;
+    for (int b = 0; b < nb; b++) {
+        const float * qb  = q      + b * Q3J1_TQ_S_DIM;
+        float       * Sqb = Sq_out + b * Q3J1_TQ_S_DIM;
+        for (int m = 0; m < Q3J1_TQ_S_DIM; m++) {
+            const float * Srow = &q3j1_tq_S[m * Q3J1_TQ_S_DIM];
+            float acc = 0.0f;
+            for (int j = 0; j < Q3J1_TQ_S_DIM; j++) {
+                acc += qb[j] * Srow[j];
+            }
+            Sqb[m] = acc;
+        }
+    }
+}
+
+// QJL-aware q · k for one K row encoded as Q3J1_TQ.
+// Uses the identity:
+//     q · k = sum_j q[j] * (d * codebook[q_j] + corr_scale * sum_m signs[m] * S[m, j])
+//           = sum_j q[j] * d * codebook[q_j]
+//             + corr_scale * sum_m signs[m] * (S · q)[m]
+//           = q · codebook + corr_scale * <Sq, signs>
+// Skips full K reconstruction; per K row it's O(n) instead of O(n * S_DIM).
+// n: row length (multiple of 32).
+// k: nb Q3J1_TQ blocks.
+// q: [n] fp32, the Q row (used for codebook contribution).
+// Sq: [n] fp32, precomputed via ggml_q3j1_tq_precompute_Sq for this Q row.
+void ggml_vec_dot_q3j1_tq_qjl_fa(int n, float * GGML_RESTRICT s,
+                                 const block_q3j1_tq * GGML_RESTRICT k,
+                                 const float * GGML_RESTRICT q,
+                                 const float * GGML_RESTRICT Sq) {
+    assert(n % QK_Q3J1_TQ == 0);
+    const int nb = n / QK_Q3J1_TQ;
+    const float qjl_recovery_scale = 1.05f * sqrtf((float)M_PI / 2.0f) / (float)Q3J1_TQ_S_DIM;
+    float total = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const block_q3j1_tq * blk = &k[b];
+        const float d = GGML_FP16_TO_FP32(blk->d);
+        const float * qb  = q  + b * QK_Q3J1_TQ;
+        const float * Sqb = Sq + b * QK_Q3J1_TQ;
+
+        // Codebook contribution: sum_j qb[j] * d * codebook[q_j]
+        float s_codebook = 0.0f;
+        for (int j = 0; j < QK_Q3J1_TQ; j++) {
+            const uint8_t lo2 = (blk->qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+            const uint8_t hi1 = (blk->qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+            const int code = (hi1 << 2) | lo2;
+            s_codebook += qb[j] * q3j1_tq_codebook[code];
+        }
+        s_codebook *= d;
+
+        // QJL contribution: corr_scale * sum_m signs[m] * Sqb[m]
+        // signs[m] = ±1, encoded as bits in blk->cs.
+        float s_qjl = 0.0f;
+        for (int m = 0; m < Q3J1_TQ_S_DIM; m++) {
+            const float sgn = ((blk->cs[m >> 3] >> (m & 0x7)) & 0x1) ? +1.0f : -1.0f;
+            s_qjl += sgn * Sqb[m];
+        }
+        total += s_codebook + (d * qjl_recovery_scale) * s_qjl;
+    }
+    *s = total;
+}
+
+// AVX2/FMA fused vec_dot lives in ggml-cpu/quants.c (libggml-cpu has -mavx2 -mfma;
+// libggml-base where this file lives does not). It uses q3j1_tq_get_S(),
+// q3j1_tq_get_codebook(), q3j1_tq_should_skip_qjl() to access this file's static data.
+
 static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
     static_assert(QK4_1 == 32, "QK4_1 must be 32");
 
@@ -5287,8 +5657,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 }
             } break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_GENTEKI_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
+            } break;
+        case GGML_TYPE_GENTEKI_Q3J1:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_genteki_q3j1, data, nb);
+            } break;
+        case GGML_TYPE_Q3J1_TQ:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q3j1_tq, data, nb);
             } break;
         case GGML_TYPE_Q4_1:
             {

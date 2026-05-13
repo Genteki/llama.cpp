@@ -38,6 +38,164 @@ void quantize_row_q5_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q5_1_ref(x, y, k);
 }
 
+void quantize_row_genteki_q3j1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_genteki_q3j1_ref(x, (block_genteki_q3j1 *)y, k);
+}
+
+void quantize_row_q3j1_tq(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q3j1_tq_ref(x, (block_q3j1_tq *)y, k);
+}
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+
+// AVX2/FMA fused vec_dot for Q3J1_TQ × F32. Inlines codebook lookup, QJL Sᵀ·sign
+// reconstruction, and the dot product into one block loop. Reduces the 9.1×
+// scalar-fallback factor measured in pi0-q3j1's ablation. Lives in libggml-cpu
+// (compiled with -mavx2 -mfma) and reaches the static codebook/S in libggml-base
+// via q3j1_tq_get_codebook() / q3j1_tq_get_S() accessors.
+static void ggml_vec_dot_q3j1_tq_f32_avx2(int n, float * s,
+                                          const block_q3j1_tq * x, const float * y) {
+    const int nb = n / QK_Q3J1_TQ;
+    const float * codebook = q3j1_tq_get_codebook();
+    const float * S        = q3j1_tq_get_S();
+    const int     S_dim    = q3j1_tq_get_S_dim();
+    const int     skip_qjl = q3j1_tq_should_skip_qjl();
+    const float   qjl_recovery_scale = 1.05f * sqrtf((float)M_PI / 2.0f) / (float)S_dim;
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const block_q3j1_tq * b = &x[i];
+        const float d = GGML_FP16_TO_FP32(b->d);
+
+        float cb[QK_Q3J1_TQ];
+        for (int j = 0; j < QK_Q3J1_TQ; j++) {
+            const uint8_t lo2 = (b->qs[j >> 2] >> (2 * (j & 3))) & 0x3;
+            const uint8_t hi1 = (b->qs[8 + (j >> 3)] >> (j & 7)) & 0x1;
+            const int code = (hi1 << 2) | lo2;
+            cb[j] = d * codebook[code];
+        }
+
+        __m256 dq0 = _mm256_loadu_ps(cb +  0);
+        __m256 dq1 = _mm256_loadu_ps(cb +  8);
+        __m256 dq2 = _mm256_loadu_ps(cb + 16);
+        __m256 dq3 = _mm256_loadu_ps(cb + 24);
+
+        if (!skip_qjl) {
+            float signs[32];
+            for (int m = 0; m < S_dim; m++) {
+                signs[m] = ((b->cs[m >> 3] >> (m & 7)) & 0x1) ? +1.0f : -1.0f;
+            }
+
+            __m256 r0 = _mm256_setzero_ps();
+            __m256 r1 = _mm256_setzero_ps();
+            __m256 r2 = _mm256_setzero_ps();
+            __m256 r3 = _mm256_setzero_ps();
+            for (int m = 0; m < S_dim; m++) {
+                const __m256 sm = _mm256_set1_ps(signs[m]);
+                const float * Sm = &S[m * S_dim];
+                r0 = _mm256_fmadd_ps(sm, _mm256_loadu_ps(Sm +  0), r0);
+                r1 = _mm256_fmadd_ps(sm, _mm256_loadu_ps(Sm +  8), r1);
+                r2 = _mm256_fmadd_ps(sm, _mm256_loadu_ps(Sm + 16), r2);
+                r3 = _mm256_fmadd_ps(sm, _mm256_loadu_ps(Sm + 24), r3);
+            }
+
+            const __m256 cs = _mm256_set1_ps(d * qjl_recovery_scale);
+            dq0 = _mm256_fmadd_ps(cs, r0, dq0);
+            dq1 = _mm256_fmadd_ps(cs, r1, dq1);
+            dq2 = _mm256_fmadd_ps(cs, r2, dq2);
+            dq3 = _mm256_fmadd_ps(cs, r3, dq3);
+        }
+
+        const float * yi = y + i * QK_Q3J1_TQ;
+        acc0 = _mm256_fmadd_ps(dq0, _mm256_loadu_ps(yi +  0), acc0);
+        acc1 = _mm256_fmadd_ps(dq1, _mm256_loadu_ps(yi +  8), acc1);
+        acc2 = _mm256_fmadd_ps(dq2, _mm256_loadu_ps(yi + 16), acc2);
+        acc3 = _mm256_fmadd_ps(dq3, _mm256_loadu_ps(yi + 24), acc3);
+    }
+
+    __m256 sum = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    __m128 hi  = _mm256_extractf128_ps(sum, 1);
+    __m128 lo  = _mm256_castps256_ps128(sum);
+    __m128 r   = _mm_add_ps(hi, lo);
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_shuffle_ps(r, r, 0x1));
+    *s = _mm_cvtss_f32(r);
+}
+#endif // __AVX2__ && __FMA__
+
+// vec_dot for Q3J1_TQ × F32. AVX2/FMA fast path defined above. Scalar fallback
+// dequants per block into scratch, then scalar dot.
+void ggml_vec_dot_q3j1_tq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                              const void * GGML_RESTRICT vx, size_t bx,
+                              const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+    assert(n % QK_Q3J1_TQ == 0);
+    const block_q3j1_tq * GGML_RESTRICT x = (const block_q3j1_tq *)vx;
+    const float         * GGML_RESTRICT y = (const float *)vy;
+
+#if defined(__AVX2__) && defined(__FMA__)
+    // Env-var override (Q3J1_TQ_DISABLE_SIMD=1) forces the scalar fallback even
+    // when AVX2 is compiled in. Used by the bench harness to attribute SIMD
+    // speedup on identical workload (q3j1_qjl_scalar vs q3j1_simd).
+    static int q3j1_tq_disable_simd_cached = -1;
+    if (q3j1_tq_disable_simd_cached < 0) {
+        const char * e = getenv("Q3J1_TQ_DISABLE_SIMD");
+        q3j1_tq_disable_simd_cached = (e && atoi(e) > 0) ? 1 : 0;
+    }
+    if (!q3j1_tq_disable_simd_cached) {
+        ggml_vec_dot_q3j1_tq_f32_avx2(n, s, x, y);
+        return;
+    }
+#endif
+    // Scalar fallback (always available — used when SIMD is disabled at runtime
+    // or wasn't compiled in).
+    const int nb = n / QK_Q3J1_TQ;
+    float scratch[QK_Q3J1_TQ];
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_q3j1_tq(&x[i], scratch, QK_Q3J1_TQ);
+        for (int j = 0; j < QK_Q3J1_TQ; j++) {
+            sumf += scratch[j] * y[i * QK_Q3J1_TQ + j];
+        }
+    }
+    *s = sumf;
+}
+
+// Reference vec_dot: dequantize our blocks inline, scalar dot with fp32 vy.
+// vec_dot_type is GGML_TYPE_F32, so vy is a plain float array.
+void ggml_vec_dot_genteki_q3j1_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                   const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+
+    assert(n % QK_GENTEKI_Q3J1 == 0);
+    const int nb = n / QK_GENTEKI_Q3J1;
+    const block_genteki_q3j1 * GGML_RESTRICT x = (const block_genteki_q3j1 *)vx;
+    const float               * GGML_RESTRICT y = (const float *)vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d  = GGML_FP16_TO_FP32(x[i].d);
+        const float dc = d * 0.25f;
+
+        for (int j = 0; j < QK_GENTEKI_Q3J1; j++) {
+            const uint8_t lo2 = (x[i].qs[j >> 2] >> (2 * (j & 0x3))) & 0x3;
+            const uint8_t hi1 = (x[i].qs[8 + (j >> 3)] >> (j & 0x7)) & 0x1;
+            const int q = (int)((hi1 << 2) | lo2);
+            const float c = ((x[i].cs[j >> 3] >> (j & 0x7)) & 0x1) ? +1.0f : -1.0f;
+            const float xij = d * ((float)q - 3.5f) + dc * c;
+            sumf += xij * y[i * QK_GENTEKI_Q3J1 + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_0_ref(x, y, k);
 }

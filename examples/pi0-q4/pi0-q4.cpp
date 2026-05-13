@@ -9,42 +9,25 @@
 //       --image img1.jpg --image img2.jpg --image img3.jpg
 //       -p "pick up the red block"
 
-#include "pi0-common.h"
-
-#include "arg.h"
-#include "log.h"
-#include "common.h"
-#include "llama.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
-
-#include <random>
-#include <string>
-#include <vector>
+#include "pi0-q4-common.h"
 
 // ---- Main ----
 
 int main(int argc, char ** argv) {
-    // Strip pi0-specific flags (e.g. --backend) before common_params_parse,
-    // which would reject anything it doesn't know.
-    pi0_cli cli = pi0_strip_cli_args(argc, argv);
-
     common_params params;
 
     auto show_help = [](int, char ** argv) {
         printf("PI0 action prediction via flow matching\n\n");
         printf("Usage: %s -m <model_dir> \\\n", argv[0]);
         printf("         --image img1.jpg,img2.jpg,img3.jpg \\\n");
-        printf("         -p <instruction> [--backend cpu|auto|<name>] [--kv-type f32|f16|q8_0|q4_0]\n\n");
+        printf("         -p <instruction>\n\n");
         printf("  -m <dir>   Model directory containing:\n");
         printf("               pi0-gemma-2b.gguf\n");
         printf("               pi0-mmproj.gguf\n");
         printf("               pi0-action-expert.gguf\n");
-        printf("  --backend  Backend selector: 'cpu' (default), 'auto'/'gpu',\n");
-        printf("             or a concrete name like 'OpenCL', 'Vulkan', 'Metal'.\n");
-        printf("  --kv-type  KV cache element type: f32 (default), f16, q8_0, q4_0, ...\n");
     };
 
+    // Parse using common params (reuse --image for multiple images)
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MTMD, show_help)) {
         return 1;
     }
@@ -73,10 +56,10 @@ int main(int argc, char ** argv) {
     params.model.path  = pali_path;
     params.mmproj.path = mmproj_path;
 
-    // Initialize backend (selected via --backend)
-    ggml_backend_t backend = pi0_init_backend(cli.backend);
+    // Initialize backend
+    ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
-        LOG_ERR("Failed to init backend '%s'\n", cli.backend.c_str());
+        LOG_ERR("Failed to init CPU backend\n");
         return 1;
     }
 
@@ -87,7 +70,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     LOG_INF("Model loaded successfully\n");
-    pi0_dump_tensor_types(model);
 
     // Initialize LLM (needed for tokenizer and mtmd compatibility)
     auto llama_init = common_init_from_params(params);
@@ -145,29 +127,33 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Build prefix embeddings: encode images via mtmd, look up text tokens via
-    // per-row dequant of the PaliGemma embedding table (works for any quant type
-    // and avoids dequantizing the whole vocab table on host).
+    // Build prefix embeddings: encode images via mtmd, look up text tokens from embedding table
+    // Load embedding table to CPU once (for text token lookup)
+    std::vector<float> embd_table(ggml_nelements(model.pali_embed));
+    tensor_to_f32(model.pali_embed, embd_table.data());
+
     const int n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
     std::vector<float> prefix_embeddings;
     int actual_prefix_len = 0;
-    const int n_embd_out = PALI_N_EMBD;
-    std::vector<float> emb_row(PALI_N_EMBD);
+    const int n_embd_out = PALI_N_EMBD; // mmproj projects to this dim
 
     for (int ic = 0; ic < n_chunks; ic++) {
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.ptr.get(), ic);
         mtmd_input_chunk_type chunk_type = mtmd_input_chunk_get_type(chunk);
 
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            // Text tokens - look up embeddings from PaliGemma embedding table
             size_t n_tokens = 0;
             const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
 
             for (size_t t = 0; t < n_tokens; t++) {
-                embd_lookup_f32(model.pali_embed, tokens[t], emb_row.data());
-                prefix_embeddings.insert(prefix_embeddings.end(), emb_row.begin(), emb_row.end());
+                llama_token token_id = tokens[t];
+                const float * emb = &embd_table[(size_t)token_id * PALI_N_EMBD];
+                prefix_embeddings.insert(prefix_embeddings.end(), emb, emb + PALI_N_EMBD);
                 actual_prefix_len++;
             }
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            // Image chunk - encode through vision model to get embeddings
             if (mtmd_encode_chunk(ctx_vision.get(), chunk) != 0) {
                 LOG_ERR("Failed to encode image chunk %d\n", ic);
                 return 1;
@@ -183,18 +169,9 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Assembled prefix: %d tokens × %d dims\n", actual_prefix_len, PALI_N_EMBD);
 
-    // Per-inference state (KV cache lives here on the backend, no globals).
-    pi0_session session;
-    session.kv_type = pi0_ggml_type_from_string(cli.kv_type);
-    if (session.kv_type == GGML_TYPE_COUNT) {
-        LOG_ERR("Unknown --kv-type '%s' (try f32, f16, q8_0, q4_0)\n", cli.kv_type.c_str());
-        return 1;
-    }
-    LOG_INF("KV cache type: %s\n", ggml_type_name(session.kv_type));
-
-    // Run PaliGemma prefix to fill the session KV cache.
+    // Run PaliGemma prefix to get KV cache
     LOG_INF("Running PaliGemma prefix pass...\n");
-    if (!run_paligemma_prefix(model, session, backend, prefix_embeddings.data(), actual_prefix_len)) {
+    if (!run_paligemma_prefix_v2(model, backend, prefix_embeddings.data(), actual_prefix_len)) {
         LOG_ERR("Prefix pass failed\n");
         return 1;
     }
@@ -214,19 +191,22 @@ int main(int argc, char ** argv) {
     LOG_INF("\nRunning flow matching diffusion (%d steps)...\n", PI0_NUM_STEPS);
     const float dt = -1.0f / PI0_NUM_STEPS;
 
-    std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
     for (int step = 0; step < PI0_NUM_STEPS; step++) {
         float t = 1.0f + step * dt;
         LOG_INF("  Step %d/%d (t=%.2f)\n", step + 1, PI0_NUM_STEPS, t);
 
-        // Suffix prep happens inside the expert graph now (supports Q4/Q8 weights).
-        if (!run_expert_step(model, session, backend,
-                             robot_state.data(), x_t.data(), t, v_t.data())) {
+        // Prepare suffix embeddings
+        std::vector<float> suffix_emb(EXPERT_N_EMBD * (PI0_ACTION_HORIZON + 1));
+        prepare_suffix(model, robot_state.data(), x_t.data(), t, suffix_emb.data());
+
+        // Run action expert
+        std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
+        if (!run_expert_step(model, backend, suffix_emb.data(), v_t.data())) {
             LOG_ERR("Expert step %d failed\n", step);
             return 1;
         }
 
-        // Euler update: x_t += dt * v_t
+        // Update: x_t = x_t + dt * v_t
         for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
             x_t[i] += dt * v_t[i];
         }
@@ -247,8 +227,10 @@ int main(int argc, char ** argv) {
     }
 
     // Cleanup
-    pi0_session_free(session);
-    free_pi0_model(model);
+    if (model.buf_pali)   ggml_backend_buffer_free(model.buf_pali);
+    if (model.buf_expert) ggml_backend_buffer_free(model.buf_expert);
+    if (model.ctx_pali)   ggml_free(model.ctx_pali);
+    if (model.ctx_expert) ggml_free(model.ctx_expert);
     ggml_backend_free(backend);
 
     return 0;

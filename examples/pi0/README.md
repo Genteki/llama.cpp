@@ -82,10 +82,9 @@ export PI0_EXPERT_PATH=/path/to/pi0-action-expert.gguf
 
 ./build/bin/llama-pi0 \
     -m /home/genteki/gguf/pi0 \
-    --image ../data/cam_left_wrist.jpg \
-    --image ../data/cam_right_wrist.jpg \
-    --image ../data/cam_high.jpg \
+    --image ../data/cam_left_wrist.jpg,../data/cam_right_wrist.jpg,../data/cam_high.jpg \
     -p "pick up the red block"
+    --backend cpu --kv-type f32
 ```
 
 **Arguments**:
@@ -100,6 +99,16 @@ export PI0_EXPERT_PATH=/path/to/pi0-action-expert.gguf
   --image ../data/cam_left_wrist.jpg,../data/cam_right_wrist.jpg,../data/cam_high.jpg \
   -p "pick up the red block" \
   -n 20 --warmup 3
+  --backend cpu --kv-type f16
+```
+
+OpenCL:
+```
+./build-cl/bin/llama-pi0-bench -m /home/genteki/gguf/pi0 \
+  --image ../data/cam_left_wrist.jpg,../data/cam_right_wrist.jpg,../data/cam_high.jpg \
+  -p "pick up the red block" \
+  -n 5 --warmup 1 \
+  --backend OpenCL --kv-type f32
 ```
 
 ### Understanding the Output
@@ -146,7 +155,7 @@ At each step: `x_t = x_t + dt × v_t`, where `v_t` is the velocity predicted by 
 ## Android Build Guide
 
 ### Prerequisites
-Android NDK — download from developer.android.com/ndk or install via Android Studio's SDK Manager. Note the path (e.g. $HOME/Android/Sdk/ndk/<version>).
+Android NDK — download from developer.android.com/ndk or install via Android Studio's SDK Manager. Note the path (e.g. $HOME/android-sdk/ndk/26.3.11579264).
 
 CMake 3.21+ on your host machine.
 

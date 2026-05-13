@@ -115,6 +115,9 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = n_prompt;
     // enable performance counters
     ctx_params.no_perf = false;
+    // custom KV cache type (F16 by default; set to GGML_TYPE_GENTEKI_Q4_0 or GGML_TYPE_GENTEKI_Q3J1 to test)
+    ctx_params.type_k = GGML_TYPE_GENTEKI_Q3J1;
+    ctx_params.type_v = GGML_TYPE_GENTEKI_Q3J1;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 

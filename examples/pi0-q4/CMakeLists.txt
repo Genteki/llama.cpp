@@ -1,0 +1,11 @@
+set(TARGET llama-pi0-q4)
+add_executable(${TARGET} pi0-q4.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET_BENCH llama-pi0-q4-bench)
+add_executable(${TARGET_BENCH} pi0-q4-bench.cpp)
+install(TARGETS ${TARGET_BENCH} RUNTIME)
+target_link_libraries(${TARGET_BENCH} PRIVATE common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_BENCH} PRIVATE cxx_std_17)
