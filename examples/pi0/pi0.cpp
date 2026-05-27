@@ -69,9 +69,17 @@ int main(int argc, char ** argv) {
     LOG_INF("  Vision mmproj:   %s\n", mmproj_path.c_str());
     LOG_INF("  Action expert:   %s\n", expert_path.c_str());
 
-    // Override params so llama loads the right model for tokenizer
+    // Override params so llama loads the right model for tokenizer.
     params.model.path  = pali_path;
     params.mmproj.path = mmproj_path;
+
+    // If the user picked CPU for our pi0 graphs, keep llama's own loader on CPU
+    // too — otherwise it auto-offloads to whatever GPU is registered and may
+    // blow past per-device alloc caps (e.g. Adreno's 1 GB OpenCL ceiling).
+    if (cli.backend == "cpu" || cli.backend == "CPU") {
+        params.n_gpu_layers   = 0;
+        params.mmproj_use_gpu = false;
+    }
 
     // Initialize backend (selected via --backend)
     ggml_backend_t backend = pi0_init_backend(cli.backend);

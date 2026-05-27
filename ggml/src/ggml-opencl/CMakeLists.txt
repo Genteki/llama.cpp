@@ -109,6 +109,8 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q8_0_f32_l4_lm
     mul_mm_q6_k_f32_l4_lm
     mul_mm_q8_0_f32_8x4
+    mul_mm_q8_0_rt_f16_dp8
+    quantize_q8_0_rt
     gemv_noshuffle_q4_1_f32
     gemm_noshuffle_q4_1_f32
     gemv_noshuffle_general_q8_0_f32
@@ -148,6 +150,7 @@ set(GGML_OPENCL_KERNELS
     conv2d
     conv2d_f16_f32
     flash_attn_f32_f16
+    flash_attn_f32_f16_j8
     flash_attn_f16
     flash_attn_f32
 )

@@ -158,6 +158,17 @@ bool run_expert_step(pi0_model & m,
 // Works for F32, F16, and any quantized type registered with ggml_get_type_traits.
 void embd_lookup_f32(ggml_tensor * t, int token_id, float * out_f32);
 
+// ---- PI0 Q8_0 Row-Tile overlay (Phase 2D) ----
+//
+// Load a .rt.bin overlay produced by dp8-spike/quantize_rt.py and attach the
+// repacked weights to the OpenCL backend so subsequent ggml_mul_mat goes
+// through the dp8 path. No-op (returns false) if backend is not OpenCL or the
+// device lacks cl_qcom_dot_product8.
+//
+// Tensor lookup uses gguf names (e.g. "blk.7.attn_q.weight") against
+// m.ctx_expert, so only Action Expert weights are overlaid.
+bool pi0_attach_rt_overlay(pi0_model & m, ggml_backend_t backend, const std::string & path);
+
 std::string resolve_model_dir(const std::string & path);
 
 // ---- Backend selection ----
@@ -187,6 +198,7 @@ void pi0_dump_tensor_types(const pi0_model & m);
 struct pi0_cli {
     std::string backend = "cpu";
     std::string kv_type = "f32"; // see pi0_ggml_type_from_string
+    std::string rt_bin  = "";    // optional Phase-2D Q8_0_RT overlay (.rt.bin)
 };
 
 pi0_cli pi0_strip_cli_args(int & argc, char ** argv);

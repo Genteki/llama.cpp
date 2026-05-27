@@ -159,6 +159,13 @@ int main(int argc, char ** argv) {
     params.model.path  = pali_path;
     params.mmproj.path = mmproj_path;
 
+    // Mirror --backend cpu onto llama's own loader so it doesn't auto-offload
+    // the tokenizer model to a GPU that can't hold it (Adreno OpenCL alloc cap).
+    if (cli.backend == "cpu" || cli.backend == "CPU") {
+        params.n_gpu_layers   = 0;
+        params.mmproj_use_gpu = false;
+    }
+
     LOG_INF("Model directory: %s\n", model_dir.c_str());
     LOG_INF("Benchmark: %d iterations + %d warmup\n", bp.n_iter, bp.n_warmup);
 
@@ -176,6 +183,23 @@ int main(int argc, char ** argv) {
         return 1;
     }
     pi0_dump_tensor_types(model);
+
+    // Phase-2D: optional Q8_0 Row-Tile overlay(s) for the Adreno dp8 path.
+    // Accepts comma-separated paths so one invocation can cover both
+    // Action Expert and PaliGemma backbone (separate .rt.bin files).
+    if (!cli.rt_bin.empty()) {
+        size_t start = 0;
+        while (start < cli.rt_bin.size()) {
+            size_t comma = cli.rt_bin.find(',', start);
+            std::string path = cli.rt_bin.substr(start, comma - start);
+            start = (comma == std::string::npos) ? cli.rt_bin.size() : comma + 1;
+            if (path.empty()) continue;
+            LOG_INF("Attaching Q8_0_RT overlay from %s\n", path.c_str());
+            if (!pi0_attach_rt_overlay(model, backend, path)) {
+                LOG_WRN("RT overlay attach failed for %s; continuing\n", path.c_str());
+            }
+        }
+    }
 
     auto llama_init = common_init_from_params(params);
     llama_model   * llm_model = llama_init->model();
@@ -326,6 +350,24 @@ int main(int argc, char ** argv) {
         }
 
         int64_t t3 = ggml_time_us();
+
+        // ---- Dump final action for numerical-correctness A/B testing ----
+        // Only first measured iter (avoids noisy multi-iter output).
+        if (!is_warmup && run == bp.n_warmup) {
+            fprintf(stderr, "ACTION_DUMP: x_t[0:7] = ");
+            for (int i = 0; i < PI0_ACTION_DIM && i < 7; i++) {
+                fprintf(stderr, "%.6f ", x_t[i]);
+            }
+            fprintf(stderr, "\n");
+            double sum = 0, sumsq = 0;
+            for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
+                sum += x_t[i]; sumsq += (double)x_t[i] * x_t[i];
+            }
+            fprintf(stderr, "ACTION_DUMP: full mean=%.6f rms=%.6f n=%d\n",
+                sum / (PI0_ACTION_DIM * PI0_ACTION_HORIZON),
+                std::sqrt(sumsq / (PI0_ACTION_DIM * PI0_ACTION_HORIZON)),
+                PI0_ACTION_DIM * PI0_ACTION_HORIZON);
+        }
 
         // ---- Record stats ----
         if (!is_warmup) {

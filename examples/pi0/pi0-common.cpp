@@ -5,11 +5,14 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-opencl.h"
 #include "gguf.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -697,6 +700,25 @@ ggml_backend_t pi0_init_backend(const std::string & name) {
         return b;
     }
 
+    // Fallback: case-insensitive substring match against device names so e.g.
+    // `--backend OpenCL` matches the Adreno device that registers as `GPUOpenCL`.
+    auto lower = [](std::string s) {
+        for (auto & c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return s;
+    };
+    const std::string needle = lower(name);
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (lower(ggml_backend_dev_name(dev)).find(needle) != std::string::npos) {
+            if (ggml_backend_t b = ggml_backend_dev_init(dev, nullptr)) {
+                LOG_INF("Backend: %s (matched '%s' by substring)\n",
+                        ggml_backend_dev_name(dev), name.c_str());
+                return b;
+            }
+        }
+    }
+
     LOG_ERR("Backend '%s' not found.\n", name.c_str());
     pi0_dump_backends();
     return nullptr;
@@ -744,6 +766,8 @@ pi0_cli pi0_strip_cli_args(int & argc, char ** argv) {
             c.backend = argv[++i];
         } else if (strcmp(argv[i], "--kv-type") == 0 && i + 1 < argc) {
             c.kv_type = argv[++i];
+        } else if (strcmp(argv[i], "--rt-bin") == 0 && i + 1 < argc) {
+            c.rt_bin = argv[++i];
         } else {
             argv[out++] = argv[i];
         }
@@ -773,4 +797,156 @@ ggml_type pi0_ggml_type_from_string(const std::string & s) {
     if (eq("q5_0")) return GGML_TYPE_Q5_0;
     if (eq("q5_1")) return GGML_TYPE_Q5_1;
     return GGML_TYPE_COUNT;
+}
+
+// ============================================================
+// Phase 2D — Q8_0 Row-Tile overlay loader
+// ============================================================
+//
+// File format (see dp8-spike/quantize_rt.py): little-endian
+//   magic    [8] = "PI0RT\0\0\0"
+//   version  u32 = 1
+//   n_tens   u32
+//   per tensor:
+//     name_len u32, name bytes
+//     rt_type  u32  (0 = Q8_0_RT)
+//     M        i64
+//     K        i64
+//     TM       u32  (must be 4)
+//     QK       u32  (must be 32)
+//     payload  u64 bytes
+//     payload  ... (M/TM)*(K/QK)*152 bytes
+//
+// Each 152-byte block covers 4 rows × 32 cols and contains
+//   128 B uint8 (4 rows row-major) | 8 B fp16 scales[4] | 16 B i32 sums[4]
+//
+// We unpack into the three row-major host arrays the dp8 GEMM kernel expects:
+//   Wq[M*K]   uint8     row-major
+//   Wd[M*K32] fp16 bits (uint16_t for transport)
+//   Ws[M*K32] int32
+
+static constexpr int RT_TM_BLOCK = 4;
+static constexpr int RT_QK_BLOCK = 32;
+static constexpr int RT_BLOCK_BYTES = 128 + 8 + 16;   // 152
+
+bool pi0_attach_rt_overlay(pi0_model & m, ggml_backend_t backend, const std::string & path) {
+    if (!ggml_backend_is_opencl(backend)) {
+        LOG_INF("pi0_attach_rt_overlay: backend is not OpenCL; skipping\n");
+        return false;
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { LOG_ERR("pi0_attach_rt_overlay: cannot open %s\n", path.c_str()); return false; }
+
+    char magic[8];
+    f.read(magic, 8);
+    if (!f || std::memcmp(magic, "PI0RT\0\0\0", 8) != 0) {
+        LOG_ERR("pi0_attach_rt_overlay: bad magic in %s\n", path.c_str());
+        return false;
+    }
+    uint32_t version = 0, n_tens = 0;
+    f.read((char*)&version, 4);
+    f.read((char*)&n_tens, 4);
+    if (!f || version != 1) {
+        LOG_ERR("pi0_attach_rt_overlay: unsupported version %u\n", version);
+        return false;
+    }
+
+    int n_attached = 0;
+    int n_skipped  = 0;
+    for (uint32_t i = 0; i < n_tens; ++i) {
+        uint32_t name_len = 0;
+        f.read((char*)&name_len, 4);
+        if (!f) { LOG_ERR("pi0_attach_rt_overlay: truncated header\n"); return false; }
+        std::string name(name_len, '\0');
+        f.read(&name[0], name_len);
+
+        uint32_t rt_type = 0;
+        int64_t  M = 0, K = 0;
+        uint32_t TM_blk = 0, QK_blk = 0;
+        uint64_t pb = 0;
+        f.read((char*)&rt_type, 4);
+        f.read((char*)&M,       8);
+        f.read((char*)&K,       8);
+        f.read((char*)&TM_blk,  4);
+        f.read((char*)&QK_blk,  4);
+        f.read((char*)&pb,      8);
+        if (!f) { LOG_ERR("pi0_attach_rt_overlay: truncated entry %s\n", name.c_str()); return false; }
+
+        if (rt_type != 0 || TM_blk != RT_TM_BLOCK || QK_blk != RT_QK_BLOCK) {
+            LOG_WRN("pi0_attach_rt_overlay: skip %s (rt_type=%u TM=%u QK=%u)\n",
+                    name.c_str(), rt_type, TM_blk, QK_blk);
+            f.seekg((std::streamoff)pb, std::ios::cur);
+            n_skipped++;
+            continue;
+        }
+
+        // Look up the ggml tensor. PaliGemma backbone and Action Expert use
+        // identical naming (blk.X.attn_q.weight) with different shapes, so
+        // search both contexts and pick the one whose shape matches the .rt.bin
+        // entry — ensures one --rt-bin can target either model.
+        ggml_tensor * t = nullptr;
+        {
+            ggml_tensor * t_e = m.ctx_expert ? ggml_get_tensor(m.ctx_expert, name.c_str()) : nullptr;
+            ggml_tensor * t_p = m.ctx_pali   ? ggml_get_tensor(m.ctx_pali,   name.c_str()) : nullptr;
+            if (t_e && t_e->ne[0] == K && t_e->ne[1] == M) t = t_e;
+            else if (t_p && t_p->ne[0] == K && t_p->ne[1] == M) t = t_p;
+        }
+        if (!t) {
+            // Silently skip — overlay may include tensors not used by this build,
+            // or no ggml tensor has the matching shape.
+            f.seekg((std::streamoff)pb, std::ios::cur);
+            n_skipped++;
+            continue;
+        }
+
+        // Read payload and unpack into 3 row-major host arrays.
+        std::vector<uint8_t> payload(pb);
+        f.read((char*)payload.data(), pb);
+        if (!f) { LOG_ERR("pi0_attach_rt_overlay: truncated payload for %s\n", name.c_str()); return false; }
+
+        const int K32 = (int)(K / RT_QK_BLOCK);
+        const int n_blk_m = (int)(M / RT_TM_BLOCK);
+        const size_t expected_bytes = (size_t) n_blk_m * (size_t) K32 * RT_BLOCK_BYTES;
+        if (pb != expected_bytes) {
+            LOG_ERR("pi0_attach_rt_overlay: payload size mismatch on %s: got %llu expected %zu\n",
+                    name.c_str(), (unsigned long long) pb, expected_bytes);
+            return false;
+        }
+
+        std::vector<uint8_t>  Wq((size_t) M * (size_t) K);
+        std::vector<uint16_t> Wd((size_t) M * (size_t) K32);
+        std::vector<int32_t>  Ws((size_t) M * (size_t) K32);
+
+        for (int mt = 0; mt < n_blk_m; ++mt) {
+            for (int kb = 0; kb < K32; ++kb) {
+                const uint8_t * blk = payload.data() + ((size_t) mt * K32 + kb) * RT_BLOCK_BYTES;
+                for (int r = 0; r < RT_TM_BLOCK; ++r) {
+                    const int row = mt * RT_TM_BLOCK + r;
+                    // data: 32 uint8 per row → row-major position
+                    std::memcpy(Wq.data() + (size_t) row * K + kb * RT_QK_BLOCK,
+                                blk + r * RT_QK_BLOCK, RT_QK_BLOCK);
+                    uint16_t s; std::memcpy(&s, blk + 128 + r * 2, 2);
+                    int32_t  rs; std::memcpy(&rs, blk + 136 + r * 4, 4);
+                    Wd[(size_t) row * K32 + kb] = s;
+                    Ws[(size_t) row * K32 + kb] = rs;
+                }
+            }
+        }
+
+        const bool ok = ggml_backend_opencl_attach_rt_weights(
+            backend, t,
+            Wq.data(), Wd.data(), Ws.data(),
+            (int) M, (int) K);
+        if (!ok) {
+            LOG_WRN("pi0_attach_rt_overlay: attach failed for %s\n", name.c_str());
+            n_skipped++;
+            continue;
+        }
+        n_attached++;
+    }
+
+    LOG_INF("pi0_attach_rt_overlay: attached %d/%u tensors from %s (skipped %d)\n",
+            n_attached, n_tens, path.c_str(), n_skipped);
+    return n_attached > 0;
 }

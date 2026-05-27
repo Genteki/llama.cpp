@@ -95,7 +95,7 @@ export PI0_EXPERT_PATH=/path/to/pi0-action-expert.gguf
 ### Bench
 ```
 ./build/bin/llama-pi0-bench \
-  -m /home/genteki/gguf/pi0 \
+  -m /home/genteki/gguf/pi0-q8 \
   --image ../data/cam_left_wrist.jpg,../data/cam_right_wrist.jpg,../data/cam_high.jpg \
   -p "pick up the red block" \
   -n 20 --warmup 3
@@ -166,7 +166,7 @@ cd /home/genteki/gentekis_document/research/pi0/llama.cpp
 
 ### Set your NDK path
 '''
-export NDK=~/Android/Sdk/ndk/<version>   # adjust to your actual path
+export NDK=~/android-sdk/Sdk/ndk/<version>   # adjust to your actual path
 '''
 
 ### Quantize
@@ -198,8 +198,18 @@ cmake --build build-android --target llama-pi0-bench -j$(nproc)
 
 **Deploy to device**
 '''
-adb push build-android/bin/llama-pi0 /data/local/tmp/llama-cpp/
-adb push /path/to/your/pi0-gguf /data/local/tmp/pi0-gguf
+adb shell mkdir -p /data/local/tmp/pi0/data
+adb push build-android/bin/llama-pi0       /data/local/tmp/pi0/
+adb push build-android/bin/llama-pi0-bench /data/local/tmp/pi0/
+adb push /home/genteki/gguf/pi0-q4        /data/local/tmp/pi0/gguf
+
+# Test images — adjust paths if they live elsewhere
+adb push data/cam_left_wrist.jpg data/cam_right_wrist.jpg data/cam_high.jpg \
+         /data/local/tmp/pi0/data/
+
+adb shell
+cd /data/local/tmp/pi0
+chmod +x llama-pi0 llama-pi0-bench  
 '''
 
 **On device**
@@ -211,10 +221,28 @@ chmod +x llama-pi0
 '''
 
 
+Inference
 ```
-./llama-cpp-vk/llama-pi0-bench \
-  -m ./pi0-gguf \
-  --image ./llama-cpp/data/cam_left_wrist.jpg,./llama-cpp/data/cam_right_wrist.jpg,./llama-cpp/data/cam_high.jpg \
-  -p "pick up the red block" \
-  -n 10 --warmup 3
+./llama-pi0 -m gguf/pi0-q4 \
+    --image data/cam_left_wrist.jpg \
+    --image data/cam_right_wrist.jpg \
+    --image data/cam_high.jpg \
+    -p "pick up the red block" \
+    --backend cpu/auto/GPUOpenCL --kv-type f16
+```
+Bench
+```
+./llama-pi0-bench -m gguf/pi0-q4 \
+    --image data/cam_left_wrist.jpg,data/cam_right_wrist.jpg,data/cam_high.jpg \
+    -p "pick up the red block" \
+    -n 1 --warmup 1 \
+    --backend GPUOpenCL --kv-type f16
+```
+(CPU)
+```
+./llama-pi0-bench -m gguf/pi0-q4 \
+    --image data/cam_left_wrist.jpg,data/cam_right_wrist.jpg,data/cam_high.jpg \
+    -p "pick up the red block" \
+    -n 1 --warmup 1 -ngl 0 \
+    --backend cpu --kv-type f16
 ```
