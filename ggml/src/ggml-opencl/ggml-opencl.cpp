@@ -322,6 +322,10 @@ struct ProfilingInfo {
     size_t local_size[3];
     // Op output size.
     size_t output_size[4];
+    // For FLOPS estimation in the aggregated summary.
+    int     op_type;        // ggml_op enum value, or -1 if unknown
+    int64_t src0_ne[4];     // input 0 dims (zeros if no src0)
+    int64_t src1_ne[4];     // input 1 dims (zeros if no src1)
 };
 
 static void populateProfilingInfo(
@@ -355,6 +359,53 @@ static void populateProfilingInfo(
     info.output_size[1] = tensor->ne[1];
     info.output_size[2] = tensor->ne[2];
     info.output_size[3] = tensor->ne[3];
+
+    info.op_type = (int) tensor->op;
+    for (int i = 0; i < 4; ++i) {
+        info.src0_ne[i] = (tensor->src[0] ? tensor->src[0]->ne[i] : 0);
+        info.src1_ne[i] = (tensor->src[1] ? tensor->src[1]->ne[i] : 0);
+    }
+}
+
+// FLOPs estimator per ggml op. Output element count is used as fallback for
+// ops without a precise formula; specialized cases cover the heavyweights.
+static uint64_t estimate_op_flops(const ProfilingInfo & info) {
+    const uint64_t ne0 = info.output_size[0];
+    const uint64_t ne1 = info.output_size[1];
+    const uint64_t ne2 = info.output_size[2];
+    const uint64_t ne3 = info.output_size[3];
+    const uint64_t dst_n = ne0 * ne1 * ne2 * ne3;
+
+    switch ((ggml_op) info.op_type) {
+        case GGML_OP_MUL_MAT: {
+            // dst[N, M, n_head, n_batch] = src0^T @ src1 with src0_ne[0]=K reduction dim
+            const uint64_t K = (uint64_t) info.src0_ne[0];
+            return 2ULL * ne0 * ne1 * ne2 * ne3 * K;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // src0 = Q [d_head, n_q, n_head, n_batch]
+            // src1 = K [d_head, n_kv, n_head_kv, n_batch]
+            // QK^T + V product ~ 4 * n_q * n_kv * d_head * n_head * n_batch
+            const uint64_t d_head = (uint64_t) info.src0_ne[0];
+            const uint64_t n_q    = (uint64_t) info.src0_ne[1];
+            const uint64_t n_h    = (uint64_t) info.src0_ne[2];
+            const uint64_t n_b    = (uint64_t) info.src0_ne[3];
+            const uint64_t n_kv   = (uint64_t) info.src1_ne[1];
+            return 4ULL * n_q * n_kv * d_head * n_h * n_b;
+        }
+        case GGML_OP_MUL: case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_DIV:
+            return dst_n;
+        case GGML_OP_SOFT_MAX:
+            return 5ULL * dst_n;   // max + sub + exp + sum + div
+        case GGML_OP_RMS_NORM: case GGML_OP_NORM:
+            return 5ULL * dst_n;
+        case GGML_OP_UNARY:
+            return 10ULL * dst_n;  // approx for tanh/erf/exp-based activations
+        case GGML_OP_ROPE:
+            return 6ULL * dst_n;   // sincos + complex rotate
+        default:
+            return dst_n;
+    }
 }
 
 struct ggml_backend_opencl_context;
@@ -511,9 +562,17 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
-    // PI0 j=8/j=16 specialization for (DK=DV=256) — see flash_attn_f32_f16_j8.cl
-    cl_kernel kernel_flash_attn_f32_f16_j8  = nullptr;
-    cl_kernel kernel_flash_attn_f32_f16_j16 = nullptr;
+    // PI0 j-stride sweep for (DK=DV=256) — see flash_attn_f32_f16_j8.cl
+    // Indexed by J_STRIDE (2,4,8,16). Used for register-spill bandwidth study.
+    std::map<int, cl_kernel> kernels_flash_attn_f32_f16_jstride;
+    // PI0 DV-spill probe: same kernel template compiled with DV=128 (DK=256, J=8).
+    // o_acc[] halves -> if perf jumps a lot, register spill on DV side was the bottleneck.
+    // NUMERICALLY WRONG (only writes first half of V output). Timing/GFLOPS valid only.
+    cl_kernel kernel_flash_attn_f32_f16_j8_dvhalf = nullptr;
+    // PI0 DK-spill probe: same kernel template compiled with DK=128 (DV=256, J=8).
+    // q_priv[] halves -> if perf jumps a lot, register spill on q side was the bottleneck.
+    // NUMERICALLY WRONG (only dots first half of d_head). Timing/GFLOPS valid only.
+    cl_kernel kernel_flash_attn_f32_f16_j8_dkhalf = nullptr;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -680,15 +739,23 @@ struct ggml_backend_opencl_context {
         }
         fclose(ftrace);
 
-        // ---- Per-kernel aggregated summary to stdout ----
-        struct Agg { cl_ulong total_ns = 0; size_t calls = 0; };
+        // ---- Per-kernel aggregated summary with FLOPS ----
+        struct Agg {
+            cl_ulong total_ns   = 0;
+            size_t   calls      = 0;
+            uint64_t total_flops = 0;
+        };
         std::map<std::string, Agg> agg;
-        cl_ulong grand_total_ns = 0;
+        cl_ulong grand_total_ns    = 0;
+        uint64_t grand_total_flops = 0;
         for (const ProfilingInfo & info : profiling_info) {
             Agg & a = agg[info.kernel_name];
-            a.total_ns += info.cmd_duration_ns;
-            a.calls   += 1;
-            grand_total_ns += info.cmd_duration_ns;
+            uint64_t flops = estimate_op_flops(info);
+            a.total_ns    += info.cmd_duration_ns;
+            a.calls       += 1;
+            a.total_flops += flops;
+            grand_total_ns    += info.cmd_duration_ns;
+            grand_total_flops += flops;
         }
         std::vector<std::pair<std::string, Agg>> sorted;
         sorted.reserve(agg.size());
@@ -697,20 +764,25 @@ struct ggml_backend_opencl_context {
             [](const std::pair<std::string, Agg> & x, const std::pair<std::string, Agg> & y){
                 return x.second.total_ns > y.second.total_ns;
             });
-        fprintf(stdout, "\n=== OpenCL per-kernel summary (device time only) ===\n");
-        fprintf(stdout, "%-46s %12s %8s %10s %7s\n",
-            "kernel", "total (ms)", "calls", "avg (ms)", "% tot");
-        fprintf(stdout, "%-46s %12s %8s %10s %7s\n",
+        fprintf(stdout, "\n=== OpenCL per-kernel summary (device time + estimated FLOPS) ===\n");
+        fprintf(stdout, "%-46s %8s %14s %8s %12s %12s\n",
+            "kernel", "calls", "total (ms)", "% tot", "GFLOPS", "total GFLOPs");
+        fprintf(stdout, "%-46s %8s %14s %8s %12s %12s\n",
             "----------------------------------------------",
-            "------------", "--------", "----------", "-------");
+            "--------", "--------------", "--------", "------------", "------------");
         for (const auto & kv : sorted) {
-            double total_ms = kv.second.total_ns / 1.0e6;
-            double avg_ms   = total_ms / (double) kv.second.calls;
-            double pct      = grand_total_ns ? 100.0 * (double) kv.second.total_ns / (double) grand_total_ns : 0.0;
-            fprintf(stdout, "%-46s %12.2f %8zu %10.4f %6.2f%%\n",
-                kv.first.c_str(), total_ms, kv.second.calls, avg_ms, pct);
+            double total_ms     = kv.second.total_ns / 1.0e6;
+            double pct          = grand_total_ns ? 100.0 * (double) kv.second.total_ns / (double) grand_total_ns : 0.0;
+            double gflops_rate  = kv.second.total_ns ? (double) kv.second.total_flops / (double) kv.second.total_ns : 0.0; // = FLOPs/ns = GFLOPs/s
+            double total_gflops = (double) kv.second.total_flops / 1.0e9;
+            fprintf(stdout, "%-46s %8zu %14.2f %7.2f%% %12.2f %12.3f\n",
+                kv.first.c_str(), kv.second.calls, total_ms, pct, gflops_rate, total_gflops);
         }
-        fprintf(stdout, "%-46s %12.2f %8zu\n", "TOTAL", grand_total_ns / 1.0e6, profiling_info.size());
+        double grand_gflops_rate = grand_total_ns ? (double) grand_total_flops / (double) grand_total_ns : 0.0;
+        double grand_total_gflops = (double) grand_total_flops / 1.0e9;
+        fprintf(stdout, "%-46s %8zu %14.2f %7s %12.2f %12.3f\n",
+            "TOTAL", profiling_info.size(), grand_total_ns / 1.0e6, "100.00%",
+            grand_gflops_rate, grand_total_gflops);
         fflush(stdout);
     }
 
@@ -1877,10 +1949,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             }
             GGML_LOG_CONT(".");
 
-            // ---- PI0 j=8 specialization for (DK=DV=128, BLOCK_M=32, BLOCK_N=32) ----
-            // 2-3× speedup over default j=2 path by collapsing 8 V product
-            // contributions into a single o_acc[] read-modify-write. See
-            // attn_breakdown spike in dp8-spike/ for diagnostic origin.
+            // ---- PI0 j-stride sweep for (DK=DV=256, BLOCK_M=16, BLOCK_N=16) ----
+            // Builds J_STRIDE = 2,4,8,16 variants from the same template so the
+            // register-spill bandwidth study controls for kernel structure.
             {
 #ifdef GGML_OPENCL_EMBED_KERNELS
                 const std::string kernel_src_j8 {
@@ -1890,30 +1961,79 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_j8 = read_file("flash_attn_f32_f16_j8.cl");
 #endif
                 if (!kernel_src_j8.empty()) {
-                    // PI0: PaliGemma 2B + Action Expert both use d_head=256.
-                    // Matches fa_dims (256, 256, 16, 16) — BLOCK_N=16 divisible by 8 and 16.
                     const std::string OPTS_BASE = compile_opts +
                         " -D DK=256 -D DV=256 -D BLOCK_M=16 -D BLOCK_N=16";
 
-                    // J=8 variant (2 outer-j iters per K-tile)
-                    {
-                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=8";
+                    const int jstride_vals[] = {2, 4, 8, 16};
+                    for (int j : jstride_vals) {
+                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=" + std::to_string(j);
                         cl_program prog = build_program_from_source(
                             backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
-                        CL_CHECK((backend_ctx->kernel_flash_attn_f32_f16_j8 =
-                            clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernels_flash_attn_f32_f16_jstride[j] = k;
                         CL_CHECK(clReleaseProgram(prog));
                         GGML_LOG_CONT(".");
                     }
-                    // J=16 variant (1 outer-j iter per K-tile — outer loop disappears)
+
+                    // DV=128 probe (DK=256, J=8). Same kernel, halves o_acc array.
                     {
-                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=16";
+                        const std::string OPTS = compile_opts +
+                            " -D DK=256 -D DV=128 -D BLOCK_M=16 -D BLOCK_N=16 -D J_STRIDE=8";
                         cl_program prog = build_program_from_source(
                             backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
-                        CL_CHECK((backend_ctx->kernel_flash_attn_f32_f16_j16 =
-                            clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf = k;
                         CL_CHECK(clReleaseProgram(prog));
                         GGML_LOG_CONT(".");
+                    }
+                    // DK=128 probe (DV=256, J=8). Same kernel, halves q_priv array.
+                    {
+                        const std::string OPTS = compile_opts +
+                            " -D DK=128 -D DV=256 -D BLOCK_M=16 -D BLOCK_N=16 -D J_STRIDE=8";
+                        cl_program prog = build_program_from_source(
+                            backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf = k;
+                        CL_CHECK(clReleaseProgram(prog));
+                        GGML_LOG_CONT(".");
+                    }
+
+                    // Diagnostic: dump register-spill evidence for d_head=256 path.
+                    // CL_KERNEL_PRIVATE_MEM_SIZE > 0 means the compiler allocated
+                    // per-WI private memory — i.e. registers spilled to DRAM.
+                    {
+                        auto dump = [&](const char * tag, cl_kernel k) {
+                            if (!k) return;
+                            cl_ulong priv_mem = 0, local_mem = 0;
+                            size_t   max_wg = 0, pref_wg_mul = 0;
+                            clGetKernelWorkGroupInfo(k, backend_ctx->device,
+                                CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(priv_mem),  &priv_mem,  nullptr);
+                            clGetKernelWorkGroupInfo(k, backend_ctx->device,
+                                CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(local_mem), &local_mem, nullptr);
+                            clGetKernelWorkGroupInfo(k, backend_ctx->device,
+                                CL_KERNEL_WORK_GROUP_SIZE,  sizeof(max_wg),    &max_wg,    nullptr);
+                            clGetKernelWorkGroupInfo(k, backend_ctx->device,
+                                CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                                sizeof(pref_wg_mul), &pref_wg_mul, nullptr);
+                            GGML_LOG_INFO("\n[fa-spill] %-32s private=%llu B/WI  local=%llu B  max_wg=%zu  pref_mul=%zu",
+                                tag,
+                                (unsigned long long) priv_mem,
+                                (unsigned long long) local_mem,
+                                max_wg, pref_wg_mul);
+                        };
+                        cl_kernel k_orig = backend_ctx->kernels_flash_attn_f32_f16.count({256, 256})
+                            ? backend_ctx->kernels_flash_attn_f32_f16[{256, 256}] : nullptr;
+                        dump("flash_attn_f32_f16 (baseline)", k_orig);
+                        for (int j : jstride_vals) {
+                            char tag[64];
+                            snprintf(tag, sizeof(tag), "flash_attn_f32_f16_j%d", j);
+                            dump(tag, backend_ctx->kernels_flash_attn_f32_f16_jstride[j]);
+                        }
+                        dump("flash_attn_f32_f16_j8_dvhalf", backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf);
+                        dump("flash_attn_f32_f16_j8_dkhalf", backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf);
                     }
                 }
             }
@@ -8680,29 +8800,57 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     } else {
         if (is_mixed) {
             // PI0 j-stride fast-path: DK=DV=256 mixed-precision attention.
-            // Env var GGML_OPENCL_FA_J8 selects variant:
-            //   "0"    -> disabled (use default j=2 kernel; baseline A/B test)
-            //   "16"   -> j=16 (1 outer-j iter; max RMW amortization, max register pressure)
-            //   any other / unset -> j=8 (default, validated 2× speedup on PI0)
-            enum { FA_J2 = 0, FA_J8 = 8, FA_J16 = 16 };
-            static const int fa_mode = []{
-                const char * env = getenv("GGML_OPENCL_FA_J8");
+            // Env var GGML_OPENCL_FA_J selects variant (sweep mode):
+            //   "0"          -> baseline kernel (flash_attn_f32_f16, j=2-ish internal)
+            //   "2|4|8|16"   -> j-stride variant from flash_attn_f32_f16_j8 template
+            //   unset        -> default to j=8 (validated 2× speedup on PI0)
+            // Back-compat: also honors legacy GGML_OPENCL_FA_J8 (0/16 only).
+            static const int fa_j_mode = []{
+                const char * env = getenv("GGML_OPENCL_FA_J");
+                if (!env) env = getenv("GGML_OPENCL_FA_J8");
+                int v = 8; // default
                 if (env) {
-                    if (env[0] == '0') { fprintf(stderr, "FA-J8 disabled (default j=2)\n"); return (int) FA_J2; }
-                    if (env[0] == '1' && env[1] == '6') { fprintf(stderr, "FA-J16 selected\n"); return (int) FA_J16; }
+                    v = atoi(env);
+                    if (v != 0 && v != 2 && v != 4 && v != 8 && v != 16) {
+                        fprintf(stderr, "FA-J: invalid value '%s', falling back to j=8\n", env);
+                        v = 8;
+                    }
                 }
-                fprintf(stderr, "FA-J8 selected (default)\n");
-                return (int) FA_J8;
+                if (v == 0) fprintf(stderr, "FA-J: baseline kernel (j=2 default path)\n");
+                else        fprintf(stderr, "FA-J: j=%d sweep variant\n", v);
+                return v;
             }();
             cl_kernel j_kernel = nullptr;
-            if (d_head_q == 256 && d_head_v == 256) {
-                if      (fa_mode == FA_J8  && backend_ctx->kernel_flash_attn_f32_f16_j8 ) j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8;
-                else if (fa_mode == FA_J16 && backend_ctx->kernel_flash_attn_f32_f16_j16) j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j16;
+            if (fa_j_mode != 0 && d_head_q == 256 && d_head_v == 256) {
+                // DV=128 spill probe: GGML_OPENCL_FA_DVHALF=1 forces the half-DV variant.
+                // Numerically incorrect (writes only first 128 of 256 V), but timing/GFLOPS valid.
+                static const bool dv_half = []{
+                    const char * e = getenv("GGML_OPENCL_FA_DVHALF");
+                    bool on = e && atoi(e) != 0;
+                    if (on) fprintf(stderr, "FA-DVHALF: WARNING numerically wrong, timing-only probe\n");
+                    return on;
+                }();
+                static const bool dk_half = []{
+                    const char * e = getenv("GGML_OPENCL_FA_DKHALF");
+                    bool on = e && atoi(e) != 0;
+                    if (on) fprintf(stderr, "FA-DKHALF: WARNING numerically wrong, timing-only probe\n");
+                    return on;
+                }();
+                if (dv_half && backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf) {
+                    j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf;
+                } else if (dk_half && backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf) {
+                    j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf;
+                } else {
+                    auto it = backend_ctx->kernels_flash_attn_f32_f16_jstride.find(fa_j_mode);
+                    if (it != backend_ctx->kernels_flash_attn_f32_f16_jstride.end()) {
+                        j_kernel = it->second;
+                    }
+                }
             }
             if (j_kernel != nullptr) {
                 kernel = j_kernel;
                 static int hits = 0;
-                if (hits++ < 1) fprintf(stderr, "FA-J%d HIT: n_q=%d n_kv=%d head=%d\n", fa_mode, n_q, n_kv, n_head);
+                if (hits++ < 1) fprintf(stderr, "FA-J%d HIT: n_q=%d n_kv=%d head=%d\n", fa_j_mode, n_q, n_kv, n_head);
             } else {
                 kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
             }

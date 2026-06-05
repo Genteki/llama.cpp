@@ -31,8 +31,8 @@
 #define J_STRIDE 8
 #endif
 
-#if J_STRIDE != 8 && J_STRIDE != 16
-#error "J_STRIDE must be 8 or 16"
+#if J_STRIDE != 2 && J_STRIDE != 4 && J_STRIDE != 8 && J_STRIDE != 16
+#error "J_STRIDE must be 2, 4, 8, or 16"
 #endif
 #if (BLOCK_N % J_STRIDE) != 0
 #error "BLOCK_N must be divisible by J_STRIDE"
@@ -48,7 +48,11 @@ inline float get_alibi_slope(
 }
 
 // ---- Macros to unroll J_STRIDE lanes without making the body unreadable ----
-#if J_STRIDE == 8
+#if J_STRIDE == 2
+#define EACH_LANE(MACRO) MACRO(0) MACRO(1)
+#elif J_STRIDE == 4
+#define EACH_LANE(MACRO) MACRO(0) MACRO(1) MACRO(2) MACRO(3)
+#elif J_STRIDE == 8
 #define EACH_LANE(MACRO) MACRO(0) MACRO(1) MACRO(2) MACRO(3) MACRO(4) MACRO(5) MACRO(6) MACRO(7)
 #elif J_STRIDE == 16
 #define EACH_LANE(MACRO) MACRO(0) MACRO(1) MACRO(2) MACRO(3) MACRO(4) MACRO(5) MACRO(6) MACRO(7) MACRO(8) MACRO(9) MACRO(10) MACRO(11) MACRO(12) MACRO(13) MACRO(14) MACRO(15)
@@ -64,6 +68,7 @@ inline float get_alibi_slope(
 #define P_DECL(n)        const ACC_TYPE p##n = exp(score##n - m_new);
 #define V_ADD(n)         + p##n * CONVERT_KV_ACC4(l_v[j+n][i])
 #define P_SUM(n)         + p##n
+#define SCORE_MAX(n)     m_new = max(m_new, score##n);
 
 __kernel void flash_attn_f32_f16_j8(
     const global void * q_void, ulong q_offset,
@@ -161,8 +166,8 @@ __kernel void flash_attn_f32_f16_j8(
 
         if (my_query_row >= n_q) continue;
 
-        // ===== J=8 inner loop — NO outer-loop unroll (Adreno hates it) =====
-        for (int j = 0; j < BLOCK_N; j += 8) {
+        // ===== J_STRIDE inner loop — NO outer-loop unroll (Adreno hates it) =====
+        for (int j = 0; j < BLOCK_N; j += J_STRIDE) {
             EACH_LANE(KROW)
 
             // 8 parallel dot products into named-scalar accumulators
@@ -188,12 +193,7 @@ __kernel void flash_attn_f32_f16_j8(
 
             // ---- Softmax: m_new = max over m_i and all J_STRIDE scores ----
             ACC_TYPE m_new = m_i;
-            m_new = max(m_new, max(max(score0, score1), max(score2, score3)));
-            m_new = max(m_new, max(max(score4, score5), max(score6, score7)));
-#if J_STRIDE >= 16
-            m_new = max(m_new, max(max(score8,  score9 ), max(score10, score11)));
-            m_new = max(m_new, max(max(score12, score13), max(score14, score15)));
-#endif
+            EACH_LANE(SCORE_MAX)
 
             const ACC_TYPE scale_prev = exp(m_i - m_new);
             EACH_LANE(P_DECL)

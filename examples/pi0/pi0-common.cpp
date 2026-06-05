@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -298,7 +299,59 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
     attn_v = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3));
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q, attn_k, attn_v, attn_mask, scale, 0.0f, 0.0f);
+
+    // Env var PI0_NO_FLASH_ATTN=1 swaps in standard 3-step attention (mul_mat + soft_max + mul_mat).
+    // Useful for comparing against flash_attn on small-context workloads where the
+    // intermediate KQ matrix fits in cache and FlashAttention's o_acc spill hurts.
+    static const bool use_flash_attn = []{
+        const char * env = getenv("PI0_NO_FLASH_ATTN");
+        if (env && env[0] == '1') { fprintf(stderr, "PI0: standard attention (no flash)\n"); return false; }
+        return true;
+    }();
+
+    ggml_tensor * attn_out;
+    if (use_flash_attn) {
+        // PI0_FIX_Q_LAYOUT=1: permute q from [head_dim, n_head, seq_len] (PI0's quirk)
+        // to standard [head_dim, seq_len, n_head] before passing to flash_attn_ext.
+        // Without this, flash_attn dispatch misreads ne[1]/ne[2] (n_q vs n_head swap),
+        // launches with 50% SIMT utilization and 2.4× extra WGs — ~3× slowdown.
+        static const bool fix_q_layout = []{
+            const char * env = getenv("PI0_FIX_Q_LAYOUT");
+            if (env && env[0] == '1') { fprintf(stderr, "PI0: q layout fix enabled for flash_attn\n"); return true; }
+            return false;
+        }();
+        ggml_tensor * q_for_fa = fix_q_layout
+            ? ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3))  // → [head_dim, seq_len, n_head]
+            : q;
+        attn_out = ggml_flash_attn_ext(ctx, q_for_fa, attn_k, attn_v, attn_mask, scale, 0.0f, 0.0f);
+        if (fix_q_layout) {
+            // flash_attn output with fixed q layout: [head_dim, n_head, seq_len] (standard).
+            // Downstream reshape_2d expects exactly this. No further work needed.
+        }
+    } else {
+        // Standard 3-step attention.
+        // Layout:
+        //   q_std:  [head_dim, seq_len,      n_head]
+        //   attn_k: [head_dim, attn_kv_len,  n_kv_head]
+        //   attn_v: [head_dim, attn_kv_len,  n_kv_head]
+        ggml_tensor * q_std = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+
+        ggml_tensor * kq = ggml_mul_mat(ctx, attn_k, q_std);          // [n_kv, n_q, n_head]
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+        // NO causal mask — PaliGemma's prefix attention is BIDIRECTIONAL (image/text/state/
+        // action tokens see each other fully). PI0's original code accidentally disabled
+        // causal in flash_attn_ext by passing q with swapped dims (n_q=n_head=8 != n_kv,
+        // so is_causal heuristic returned false). Standard attention must match this.
+        kq = ggml_soft_max_ext(ctx, kq, attn_mask, scale, 0.0f);
+
+        // V product. Reduction dim (n_kv) needs to be innermost in src0.
+        //   v_t = transpose(attn_v) → [attn_kv_len, head_dim, n_kv_head]
+        ggml_tensor * v_t = ggml_cont(ctx, ggml_transpose(ctx, attn_v));
+        ggml_tensor * kqv = ggml_mul_mat(ctx, v_t, kq);               // [head_dim, seq_len, n_head]
+
+        attn_out = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
+    }
     attn_out = ggml_reshape_2d(ctx, attn_out, n_head * head_dim, seq_len);
 
     ggml_tensor * attn_proj = ggml_mul_mat(ctx, w.o_proj, attn_out);
