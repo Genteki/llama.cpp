@@ -13,6 +13,23 @@
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+#ifdef FULL_F16
+// SIMT experiment: all activations + accumulators in fp16.
+// Private memory roughly halves (q_priv, o_acc, dot_acc, score, p all narrow).
+// Risk: softmax precision — exp(score - m_max) overflows fp16 if Δscore > ~11.
+// For PI0 prefix (scale=1/sqrt(256), raw QK ~±8) this should be safe.
+#define ACC_TYPE half
+#define ACC_TYPE4 half4
+#define Q_DATA_TYPE4 float4
+#define KV_DATA_TYPE4 half4
+#define O_DATA_TYPE4 float4
+#define MASK_DATA_TYPE half
+#define CONVERT_Q_ACC4(x) convert_half4(x)
+#define CONVERT_KV_ACC4(x) (x)
+#define CONVERT_O_DATA4(x) convert_float4(x)
+// fp16 max ≈ 65504; use literal half since HALF_MAX isn't reliably defined.
+#define ACC_NEG_INF ((half)(-65504.0h))
+#else
 #define ACC_TYPE float
 #define ACC_TYPE4 float4
 #define Q_DATA_TYPE4 float4
@@ -22,6 +39,8 @@
 #define CONVERT_Q_ACC4(x) (x)
 #define CONVERT_KV_ACC4(x) convert_float4(x)
 #define CONVERT_O_DATA4(x) (x)
+#define ACC_NEG_INF (-INFINITY)
+#endif
 
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
@@ -61,8 +80,8 @@ inline float get_alibi_slope(
 #define DOT_MAD(n)       dot_acc##n = mad(qk, CONVERT_KV_ACC4(l_k[j+n][k]), dot_acc##n);
 #define KROW(n)          const int k_row##n = k_start + j + n;
 #define SCORE_DECL(n)    ACC_TYPE score##n = (dot_acc##n.s0 + dot_acc##n.s1 + dot_acc##n.s2 + dot_acc##n.s3) * scale;
-#define CAUSAL_MASK(n)   if (k_row##n > (n_kv - n_q + my_query_row)) score##n = -INFINITY;
-#define BOUND_MASK(n)    if (k_row##n >= n_kv) score##n = -INFINITY;
+#define CAUSAL_MASK(n)   if (k_row##n > (n_kv - n_q + my_query_row)) score##n = ACC_NEG_INF;
+#define BOUND_MASK(n)    if (k_row##n >= n_kv) score##n = ACC_NEG_INF;
 #define MASK_ADD(n)      if (k_row##n < n_kv) score##n += slope * (ACC_TYPE) mask_ptr[k_row##n];
 #define SOFTCAP(n)       score##n = logit_softcap * tanh(score##n / logit_softcap);
 #define P_DECL(n)        const ACC_TYPE p##n = exp(score##n - m_new);
@@ -124,6 +143,22 @@ __kernel void flash_attn_f32_f16_j8(
         mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
+#ifdef Q_IN_LDS
+    // SIMT experiment: keep q in LDS instead of per-WI private memory.
+    // Layout is TRANSPOSED to [DK_VEC][BLOCK_M] to avoid bank conflicts.
+    // With the naive [BLOCK_M][DK_VEC] layout, 16 WIs reading l_q[tid][k]
+    // for fixed k differ by row stride = DK_VEC*16 = 1024 bytes → all hit
+    // the same Adreno bank (mod 32*4) → 16-way serialization.
+    // Transposed: 16 WIs reading l_q[k][tid] differ by 16 bytes → 4-way
+    // bank spread per WI × 16 WIs ≈ 2 LDS cycles instead of 16.
+    __local ACC_TYPE4 l_q[DK_VEC][BLOCK_M];
+    if (my_query_row < n_q) {
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
+        const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
+        #pragma unroll
+        for (int i = 0; i < DK_VEC; ++i) l_q[i][tid] = CONVERT_Q_ACC4(q_ptr[i]);
+    }
+#else
     ACC_TYPE4 q_priv[DK_VEC];
     if (my_query_row < n_q) {
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
@@ -131,17 +166,23 @@ __kernel void flash_attn_f32_f16_j8(
         #pragma unroll
         for (int i = 0; i < DK_VEC; ++i) q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
     }
+#endif
 
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
-    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE m_i = ACC_NEG_INF;
     ACC_TYPE l_i = 0.0f;
 
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
+
+#ifdef Q_IN_LDS
+    // Barrier so all WIs see the loaded l_q before the dot product reads it.
+    barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
         for (int i = tid; i < BLOCK_N * DK_VEC; i += WG_SIZE) {
@@ -174,7 +215,11 @@ __kernel void flash_attn_f32_f16_j8(
             EACH_LANE(DOT_INIT)
             #pragma unroll
             for (int k = 0; k < DK_VEC; k++) {
+#ifdef Q_IN_LDS
+                ACC_TYPE4 qk = l_q[tid][k];
+#else
                 ACC_TYPE4 qk = q_priv[k];
+#endif
                 EACH_LANE(DOT_MAD)
             }
             EACH_LANE(SCORE_DECL)

@@ -58,9 +58,12 @@ MUL_MAT_NAMES = {
     "ffn_up.weight", "ffn_down.weight", "mm.0.weight",
     # Gemma LLM names
     "attn_output.weight", "ffn_gate.weight",
-    # Action expert custom
+    # Action expert custom (pi0)
     "action_in_proj.weight", "action_out_proj.weight", "state_proj.weight",
     "action_time_mlp_in.weight", "action_time_mlp_out.weight",
+    # pi0.5 action expert: adaRMS modulation Dense + time MLP
+    "attn_norm.dense.weight", "ffn_norm.dense.weight", "output_norm.dense.weight",
+    "time_mlp_in.weight", "time_mlp_out.weight",
 }
 
 
@@ -111,6 +114,10 @@ def add_tokenizer(writer, tokenizer_path: Path):
     writer.add_uint32("tokenizer.ggml.eos_token_id", sp.eos_id())
     writer.add_uint32("tokenizer.ggml.padding_token_id", sp.pad_id())
     writer.add_uint32("tokenizer.ggml.unknown_token_id", sp.unk_id())
+    # PaliGemma's SentencePiece model does NOT add a dummy space prefix
+    # (openpi: encode("pick ...") -> 'pick'(18075), not '▁pick'(4788)). llama.cpp
+    # defaults add_space_prefix to true for SPM, so set it false to match.
+    writer.add_bool("tokenizer.ggml.add_space_prefix", False)
     print(f"  Vocab size: {vocab_size}, BOS: {sp.bos_id()}, EOS: {sp.eos_id()}")
 
 
@@ -397,12 +404,111 @@ def convert_action_expert(model_dir: Path, output_path: Path, use_f16: bool):
     print(f"Written: {output_path} ({os.path.getsize(output_path) / 1024**2:.1f} MB)")
 
 
+def convert_action_expert_pi05(model_dir: Path, output_path: Path, use_f16: bool):
+    """Convert pi0.5 Action Expert 300M (adaRMS) + action/time projections.
+
+    Differences vs pi0 (see openpi gemma.py / HF modeling_gemma.py):
+      * No state_proj and no action_time_mlp; instead time_mlp_in/out feed adaRMS.
+      * Each norm (input/post_attention/final) is an adaptive RMSNorm whose
+        scale/shift/gate come from a Linear(width -> 3*width) ".dense" — there is
+        NO per-channel ".weight" scale vector, so we do NOT bake the Gemma "+1"
+        here; the (1 + scale) is applied at runtime in the graph.
+    """
+    print("\n=== Converting pi0.5 Action Expert 300M (adaRMS) ===")
+
+    writer = gguf.GGUFWriter(str(output_path), arch="pi0-action-expert")
+    writer.add_type(gguf.GGUFType.MODEL)
+    writer.add_string("general.name", "pi05-action-expert")
+
+    n_embd = 1024
+    n_head = 8
+    n_kv_head = 1
+    head_dim = 256
+    n_layer = 18
+    n_ff = 4096
+    action_dim = 32
+    action_horizon = 50
+
+    writer.add_embedding_length(n_embd)
+    writer.add_feed_forward_length(n_ff)
+    writer.add_block_count(n_layer)
+    writer.add_head_count(n_head)
+    writer.add_head_count_kv(n_kv_head)
+    writer.add_key_length(head_dim)
+    writer.add_value_length(head_dim)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_uint32("pi0.action_dim", action_dim)
+    writer.add_uint32("pi0.action_horizon", action_horizon)
+    # Marker so the loader can assert it is reading a pi0.5 (adaRMS) expert.
+    writer.add_bool("pi0.pi05", True)
+    writer.add_uint32("pi0.adarms_cond_dim", n_embd)
+
+    expert_prefix = "paligemma_with_expert.gemma_expert.model.layers"
+
+    for il in range(n_layer):
+        prefix = f"{expert_prefix}.{il}"
+        blk = f"blk.{il}"
+
+        # adaRMS modulation Dense (Linear width -> 3*width). Stored as-is (no +1).
+        data = load_tensor(model_dir, f"{prefix}.input_layernorm.dense.weight")
+        add_tensor(writer, f"{blk}.attn_norm.dense.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.input_layernorm.dense.bias")
+        add_tensor(writer, f"{blk}.attn_norm.dense.bias", data, False)
+
+        data = load_tensor(model_dir, f"{prefix}.post_attention_layernorm.dense.weight")
+        add_tensor(writer, f"{blk}.ffn_norm.dense.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.post_attention_layernorm.dense.bias")
+        add_tensor(writer, f"{blk}.ffn_norm.dense.bias", data, False)
+
+        # Attention
+        data = load_tensor(model_dir, f"{prefix}.self_attn.q_proj.weight")
+        add_tensor(writer, f"{blk}.attn_q.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.self_attn.k_proj.weight")
+        add_tensor(writer, f"{blk}.attn_k.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.self_attn.v_proj.weight")
+        add_tensor(writer, f"{blk}.attn_v.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.self_attn.o_proj.weight")
+        add_tensor(writer, f"{blk}.attn_output.weight", data, use_f16)
+
+        # FFN
+        data = load_tensor(model_dir, f"{prefix}.mlp.gate_proj.weight")
+        add_tensor(writer, f"{blk}.ffn_gate.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.mlp.up_proj.weight")
+        add_tensor(writer, f"{blk}.ffn_up.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.mlp.down_proj.weight")
+        add_tensor(writer, f"{blk}.ffn_down.weight", data, use_f16)
+
+    # Final norm is adaRMS too (gate is discarded at runtime, scale/shift used).
+    data = load_tensor(model_dir, "paligemma_with_expert.gemma_expert.model.norm.dense.weight")
+    add_tensor(writer, "output_norm.dense.weight", data, use_f16)
+    data = load_tensor(model_dir, "paligemma_with_expert.gemma_expert.model.norm.dense.bias")
+    add_tensor(writer, "output_norm.dense.bias", data, False)
+
+    # Action + time projections (no state_proj / action_time_mlp in pi0.5).
+    print("\n--- Projections (action_in/out, time MLP) ---")
+    for name in ["action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"]:
+        data = load_tensor(model_dir, f"{name}.weight")
+        add_tensor(writer, f"{name}.weight", data, use_f16)
+        data = load_tensor(model_dir, f"{name}.bias")
+        add_tensor(writer, f"{name}.bias", data, False)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    print(f"Written: {output_path} ({os.path.getsize(output_path) / 1024**2:.1f} MB)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert PI0 HF model to GGUF")
     parser.add_argument("--model", type=str, required=True, help="Path to PI0 HF model directory")
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory for GGUF files")
     parser.add_argument("--type", type=str, default="f16", choices=["f16", "f32"], help="Output data type")
     parser.add_argument("--tokenizer", type=str, required=True, help="Path to paligemma_tokenizer.model (SentencePiece)")
+    parser.add_argument("--pi05", action="store_true",
+                        help="Convert a pi0.5 checkpoint (adaRMS action expert, e.g. lerobot/pi05_base). "
+                             "Vision + PaliGemma are identical to pi0; only the expert branch differs. "
+                             "Outputs pi05-*.gguf.")
     args = parser.parse_args()
 
     model_dir = Path(args.model)
@@ -411,13 +517,17 @@ def main():
     tokenizer_path = Path(args.tokenizer)
 
     use_f16 = args.type == "f16"
+    pfx = "pi05" if args.pi05 else "pi0"
 
-    convert_mmproj(model_dir, output_dir / "pi0-mmproj.gguf", use_f16)
-    convert_gemma_2b(model_dir, output_dir / "pi0-gemma-2b.gguf", use_f16, tokenizer_path)
-    convert_action_expert(model_dir, output_dir / "pi0-action-expert.gguf", use_f16)
+    convert_mmproj(model_dir, output_dir / f"{pfx}-mmproj.gguf", use_f16)
+    convert_gemma_2b(model_dir, output_dir / f"{pfx}-gemma-2b.gguf", use_f16, tokenizer_path)
+    if args.pi05:
+        convert_action_expert_pi05(model_dir, output_dir / f"{pfx}-action-expert.gguf", use_f16)
+    else:
+        convert_action_expert(model_dir, output_dir / f"{pfx}-action-expert.gguf", use_f16)
 
     print("\n=== Done! ===")
-    for name in ["pi0-mmproj.gguf", "pi0-gemma-2b.gguf", "pi0-action-expert.gguf"]:
+    for name in [f"{pfx}-mmproj.gguf", f"{pfx}-gemma-2b.gguf", f"{pfx}-action-expert.gguf"]:
         path = output_dir / name
         print(f"  {path}: {os.path.getsize(path) / 1024**2:.1f} MB")
 

@@ -59,6 +59,11 @@ int main(int argc, char ** argv) {
     std::string mmproj_path = model_dir + "/pi0-mmproj.gguf";
     std::string expert_path = model_dir + "/pi0-action-expert.gguf";
 
+    // Fused-QKV PaliGemma variant feeds only the pi0 loader; llama.cpp's gemma
+    // loader (tokenizer) still needs the unfused pi0-gemma-2b.gguf.
+    std::string pali_pi0_path = model_dir + "/pi0-gemma-2b-fused.gguf";
+    if (FILE * f = fopen(pali_pi0_path.c_str(), "rb")) { fclose(f); } else { pali_pi0_path = pali_path; }
+
     // Allow --mmproj override
     if (!params.mmproj.path.empty()) {
         mmproj_path = params.mmproj.path;
@@ -90,7 +95,7 @@ int main(int argc, char ** argv) {
 
     // Load PI0 model weights
     pi0_model model;
-    if (!load_pi0_model(model, pali_path.c_str(), expert_path.c_str(), backend)) {
+    if (!load_pi0_model(model, pali_pi0_path.c_str(), expert_path.c_str(), backend)) {
         LOG_ERR("Failed to load PI0 model\n");
         return 1;
     }
@@ -153,43 +158,68 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Build prefix embeddings: encode images via mtmd, look up text tokens via
-    // per-row dequant of the PaliGemma embedding table (works for any quant type
-    // and avoids dequantizing the whole vocab table on host).
+    // Build prefix embeddings to match openpi exactly:
+    //   [ image tokens (SigLIP, unscaled) ] ++ [ text tokens (scaled) ]
+    // Text is tokenized ourselves as  BOS + encode(prompt) + "\n"  (the openpi
+    // PaligemmaTokenizer convention). We do NOT use mtmd's text chunk: it adds a
+    // dummy space to the first word and omits the trailing newline. Text token
+    // embeddings are scaled by sqrt(hidden); image features are not.
     const int n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
     std::vector<float> prefix_embeddings;
     int actual_prefix_len = 0;
     const int n_embd_out = PALI_N_EMBD;
     std::vector<float> emb_row(PALI_N_EMBD);
+    const float embd_scale = sqrtf((float) PALI_N_EMBD);
 
+    // (1) image tokens first, in --image order
     for (int ic = 0; ic < n_chunks; ic++) {
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.ptr.get(), ic);
-        mtmd_input_chunk_type chunk_type = mtmd_input_chunk_get_type(chunk);
-
-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-            size_t n_tokens = 0;
-            const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
-
-            for (size_t t = 0; t < n_tokens; t++) {
-                embd_lookup_f32(model.pali_embed, tokens[t], emb_row.data());
-                prefix_embeddings.insert(prefix_embeddings.end(), emb_row.begin(), emb_row.end());
-                actual_prefix_len++;
-            }
-        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            if (mtmd_encode_chunk(ctx_vision.get(), chunk) != 0) {
-                LOG_ERR("Failed to encode image chunk %d\n", ic);
-                return 1;
-            }
-            float * img_embd = mtmd_get_output_embd(ctx_vision.get());
-            size_t n_img_tokens = mtmd_input_chunk_get_n_tokens(chunk);
-
-            prefix_embeddings.insert(prefix_embeddings.end(),
-                img_embd, img_embd + n_img_tokens * n_embd_out);
-            actual_prefix_len += (int)n_img_tokens;
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) continue;
+        if (mtmd_encode_chunk(ctx_vision.get(), chunk) != 0) {
+            LOG_ERR("Failed to encode image chunk %d\n", ic);
+            return 1;
         }
+        float * img_embd = mtmd_get_output_embd(ctx_vision.get());
+        size_t n_img_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        prefix_embeddings.insert(prefix_embeddings.end(),
+            img_embd, img_embd + n_img_tokens * n_embd_out);
+        actual_prefix_len += (int) n_img_tokens;
     }
 
-    LOG_INF("Assembled prefix: %d tokens × %d dims\n", actual_prefix_len, PALI_N_EMBD);
+    // (2) text tokens: BOS + encode(prompt) + "\n"
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
+    std::vector<llama_token> text_tokens;
+    text_tokens.push_back(llama_vocab_bos(vocab));
+    {
+        std::vector<llama_token> body = common_tokenize(llm_ctx, params.prompt, /*add_special=*/false, /*parse_special=*/false);
+        text_tokens.insert(text_tokens.end(), body.begin(), body.end());
+        std::vector<llama_token> nl = common_tokenize(llm_ctx, "\n", /*add_special=*/false, /*parse_special=*/false);
+        text_tokens.insert(text_tokens.end(), nl.begin(), nl.end());
+    }
+    for (llama_token tok : text_tokens) {
+        embd_lookup_f32(model.pali_embed, tok, emb_row.data());
+        for (float & e : emb_row) e *= embd_scale;
+        prefix_embeddings.insert(prefix_embeddings.end(), emb_row.begin(), emb_row.end());
+        actual_prefix_len++;
+    }
+
+    LOG_INF("Assembled prefix: %d tokens × %d dims (%zu text tokens)\n",
+            actual_prefix_len, PALI_N_EMBD, text_tokens.size());
+
+    // [debug/compare] Optionally dump the assembled prefix embeddings so an
+    // external reference (e.g. openpi) can consume the exact same prefix and
+    // isolate LM/flow-matching differences from vision/text preprocessing.
+    if (const char * dump_path = getenv("PI0_DUMP_PREFIX")) {
+        FILE * pf = fopen(dump_path, "wb");
+        if (pf) {
+            fwrite(prefix_embeddings.data(), sizeof(float), prefix_embeddings.size(), pf);
+            fclose(pf);
+            LOG_INF("Dumped prefix embeddings to %s (%d tok x %d dims)\n",
+                    dump_path, actual_prefix_len, PALI_N_EMBD);
+        } else {
+            LOG_ERR("PI0_DUMP_PREFIX: cannot open %s for writing\n", dump_path);
+        }
+    }
 
     // Per-inference state (KV cache lives here on the backend, no globals).
     pi0_session session;
@@ -208,12 +238,27 @@ int main(int argc, char ** argv) {
     }
     LOG_INF("PaliGemma prefix KV cached (%d tokens)\n", actual_prefix_len);
 
-    // Initialize noisy actions (pure noise at t=1)
-    std::mt19937 rng(42);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-
+    // Initialize noisy actions (pure noise at t=1).
+    // For cross-implementation comparison the C++ mt19937 noise can NEVER match
+    // another stack's RNG (e.g. JAX/torch), so allow loading the exact same
+    // noise tensor from a raw float32 file via PI0_NOISE_BIN
+    // (layout: row-major [HORIZON][DIM] == x_t[t*DIM + d]).
     std::vector<float> x_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
-    for (auto & v : x_t) v = normal(rng);
+    if (const char * noise_path = getenv("PI0_NOISE_BIN")) {
+        FILE * nf = fopen(noise_path, "rb");
+        if (!nf) { LOG_ERR("PI0_NOISE_BIN: cannot open %s\n", noise_path); return 1; }
+        size_t got = fread(x_t.data(), sizeof(float), x_t.size(), nf);
+        fclose(nf);
+        if (got != x_t.size()) {
+            LOG_ERR("PI0_NOISE_BIN: expected %zu floats, read %zu\n", x_t.size(), got);
+            return 1;
+        }
+        LOG_INF("Loaded initial noise from %s (%zu floats)\n", noise_path, got);
+    } else {
+        std::mt19937 rng(42);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        for (auto & v : x_t) v = normal(rng);
+    }
 
     // Robot state (zeros for demo - in production, read from robot)
     std::vector<float> robot_state(PI0_ACTION_DIM, 0.0f);
@@ -221,6 +266,13 @@ int main(int argc, char ** argv) {
     // Diffusion loop: denoise from t=1 to t=0
     LOG_INF("\nRunning flow matching diffusion (%d steps)...\n", PI0_NUM_STEPS);
     const float dt = -1.0f / PI0_NUM_STEPS;
+
+    // [debug/compare] optionally dump every step's predicted velocity v_t.
+    FILE * vt_dump = nullptr;
+    if (const char * vt_path = getenv("PI0_DUMP_VT")) {
+        vt_dump = fopen(vt_path, "wb");
+        if (!vt_dump) LOG_ERR("PI0_DUMP_VT: cannot open %s\n", vt_path);
+    }
 
     std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
     for (int step = 0; step < PI0_NUM_STEPS; step++) {
@@ -234,11 +286,14 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        if (vt_dump) fwrite(v_t.data(), sizeof(float), v_t.size(), vt_dump);
+
         // Euler update: x_t += dt * v_t
         for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
             x_t[i] += dt * v_t[i];
         }
     }
+    if (vt_dump) fclose(vt_dump);
 
     // Output final actions
     printf("\n=== PI0 Action Predictions ===\n");

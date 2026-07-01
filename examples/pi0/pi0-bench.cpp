@@ -100,8 +100,10 @@ static void print_table(PhaseStats stats[PHASE_COUNT], int n_iter, int n_warmup)
 // which would reject unknown arguments.
 
 struct bench_params {
-    int n_iter   = 100;
-    int n_warmup = 5;
+    int  n_iter      = 100;
+    int  n_warmup    = 5;
+    bool prefix_only = false; // skip the diffusion loop so the OpenCL per-kernel
+                              // summary isolates the prefix attention GEMMs
 };
 
 static bench_params strip_bench_args(int & argc, char ** argv) {
@@ -112,6 +114,8 @@ static bench_params strip_bench_args(int & argc, char ** argv) {
             bp.n_iter = std::atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             bp.n_warmup = std::atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefix-only") == 0) {
+            bp.prefix_only = true;
         } else {
             argv[out++] = argv[i];
         }
@@ -152,6 +156,11 @@ int main(int argc, char ** argv) {
     std::string mmproj_path = model_dir + "/pi0-mmproj.gguf";
     std::string expert_path = model_dir + "/pi0-action-expert.gguf";
 
+    // Fused-QKV PaliGemma variant feeds only the pi0 loader; llama.cpp's gemma
+    // loader (tokenizer) still needs the unfused pi0-gemma-2b.gguf.
+    std::string pali_pi0_path = model_dir + "/pi0-gemma-2b-fused.gguf";
+    if (FILE * f = fopen(pali_pi0_path.c_str(), "rb")) { fclose(f); } else { pali_pi0_path = pali_path; }
+
     if (!params.mmproj.path.empty()) {
         mmproj_path = params.mmproj.path;
     }
@@ -178,7 +187,7 @@ int main(int argc, char ** argv) {
     }
 
     pi0_model model;
-    if (!load_pi0_model(model, pali_path.c_str(), expert_path.c_str(), backend)) {
+    if (!load_pi0_model(model, pali_pi0_path.c_str(), expert_path.c_str(), backend)) {
         LOG_ERR("Failed to load PI0 model\n");
         return 1;
     }
@@ -295,8 +304,12 @@ int main(int argc, char ** argv) {
             if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
                 size_t n_tokens = 0;
                 const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
+                // Gemma scales text token embeddings by sqrt(hidden); image
+                // features from SigLIP stay unscaled (PaliGemma convention).
+                const float embd_scale = sqrtf((float) PALI_N_EMBD);
                 for (size_t t = 0; t < n_tokens; t++) {
                     embd_lookup_f32(model.pali_embed, tokens[t], emb_row.data());
+                    for (float & e : emb_row) e *= embd_scale;
                     prefix_embeddings.insert(prefix_embeddings.end(), emb_row.begin(), emb_row.end());
                     actual_prefix_len++;
                 }
@@ -332,20 +345,24 @@ int main(int argc, char ** argv) {
         double expert_step_ms = 0.0;
         std::vector<float> v_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
 
-        for (int step = 0; step < PI0_NUM_STEPS; step++) {
-            float t = 1.0f + step * dt;
+        // --prefix-only skips diffusion so the OpenCL per-kernel summary contains
+        // only the prefix attention GEMMs (no expert/diffusion contamination).
+        if (!bp.prefix_only) {
+            for (int step = 0; step < PI0_NUM_STEPS; step++) {
+                float t = 1.0f + step * dt;
 
-            int64_t ts0 = ggml_time_us();
-            if (!run_expert_step(model, session, backend,
-                                 robot_state.data(), x_t.data(), t, v_t.data())) {
-                LOG_ERR("Expert step failed at run %d step %d\n", run, step);
-                return 1;
-            }
-            int64_t ts1 = ggml_time_us();
-            expert_step_ms += (ts1 - ts0) / 1000.0;
+                int64_t ts0 = ggml_time_us();
+                if (!run_expert_step(model, session, backend,
+                                     robot_state.data(), x_t.data(), t, v_t.data())) {
+                    LOG_ERR("Expert step failed at run %d step %d\n", run, step);
+                    return 1;
+                }
+                int64_t ts1 = ggml_time_us();
+                expert_step_ms += (ts1 - ts0) / 1000.0;
 
-            for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
-                x_t[i] += dt * v_t[i];
+                for (int i = 0; i < PI0_ACTION_DIM * PI0_ACTION_HORIZON; i++) {
+                    x_t[i] += dt * v_t[i];
+                }
             }
         }
 

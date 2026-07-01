@@ -632,7 +632,18 @@ ggml_tensor * clip_graph::build_attn(
         ggml_tensor * v = ggml_permute(ctx0, v_cur, 1, 2, 0, 3);
         v = ggml_cont(ctx0, v);
 
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        // Adreno (opt-in PI0_VIT_IMG=1): pad the reduction (head_dim) up to a multiple of 16 so the
+        // fast mul_mm_f32_f32_l4_lm GEMM accepts it (BK=16 tiling needs ne00%16==0). SigLIP
+        // head_dim=72 otherwise falls to the ~19 GFLOP naive mul_mat_f32_f32 (17x slower than AV).
+        // Zero-padding only adds zero terms -> kq bit-identical; kq_scale uses the true head_dim.
+        static const int pi0_vit_img = []{ const char * e = getenv("PI0_VIT_IMG"); return e ? atoi(e) : 0; }();
+        ggml_tensor * kq;
+        if (pi0_vit_img && (k->ne[0] % 16 != 0)) {
+            const int64_t pad = 16 - (k->ne[0] % 16);
+            kq = ggml_mul_mat(ctx0, ggml_pad(ctx0, k, pad, 0, 0, 0), ggml_pad(ctx0, q, pad, 0, 0, 0));
+        } else {
+            kq = ggml_mul_mat(ctx0, k, q);
+        }
         // F32 may not needed for vision encoders?
         // ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 

@@ -22,6 +22,33 @@ if (GGML_OPENCL_USE_ADRENO_KERNELS)
     add_compile_definitions(GGML_OPENCL_USE_ADRENO_KERNELS)
 endif ()
 
+if (GGML_OPENCL_USE_CLBLAST)
+    message(STATUS "OpenCL will use clBLAST for matmul kernels")
+    add_compile_definitions(GGML_OPENCL_USE_CLBLAST)
+
+    # Driven by env vars:
+    #   export CLBLAST_INC_PATH=/path/to/CLBlast/include
+    #   export CLBLAST_LIB_PATH=/path/to/CLBlast/build/<your-build>   (dir with libclblast.so)
+    find_path(CLBLAST_INCLUDE_DIR NAMES clblast.h
+        HINTS $ENV{CLBLAST_INC_PATH} $ENV{CLBLAST_INC_PATH}/include
+        DOC "Path to CLBlast header" NO_CMAKE_FIND_ROOT_PATH)
+    find_library(CLBLAST_LIBRARY NAMES clblast
+        HINTS $ENV{CLBLAST_LIB_PATH} $ENV{CLBLAST_LIB_PATH}/lib
+        DOC "Path to CLBlast library" NO_CMAKE_FIND_ROOT_PATH)
+
+    if (CLBLAST_INCLUDE_DIR AND CLBLAST_LIBRARY)
+        message(STATUS "Found CLBlast: ${CLBLAST_LIBRARY}")
+        if (TARGET clblast)
+            target_link_libraries(${TARGET_NAME} PRIVATE clblast)
+        else()
+            target_include_directories(${TARGET_NAME} PRIVATE ${CLBLAST_INCLUDE_DIR})
+            target_link_libraries(${TARGET_NAME} PRIVATE ${CLBLAST_LIBRARY})
+        endif()
+    else()
+        message(FATAL_ERROR "CLBlast not found. Set CLBLAST_INC_PATH and CLBLAST_LIB_PATH.")
+    endif()
+endif ()
+
 if (GGML_OPENCL_EMBED_KERNELS)
     add_compile_definitions(GGML_OPENCL_EMBED_KERNELS)
 

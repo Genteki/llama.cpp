@@ -254,6 +254,7 @@ option(GGML_OPENCL                          "ggml: use OpenCL"                  
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
+option(GGML_OPENCL_USE_CLBLAST              "ggml: use CLBlast for OpenCL matmul kernels"     OFF)
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 

@@ -15,6 +15,10 @@
 
 #include <CL/cl.h>
 
+#ifdef GGML_OPENCL_USE_CLBLAST
+#    include "clblast-ext.h"
+#endif
+
 #include <inttypes.h>
 #include <string.h>
 
@@ -461,6 +465,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
+    ggml_cl_buffer prealloc_pi0_at;     // PI0 attn/ViT image GEMM: reused transposed-weight (A_T) scratch
 
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
@@ -573,6 +578,17 @@ struct ggml_backend_opencl_context {
     // q_priv[] halves -> if perf jumps a lot, register spill on q side was the bottleneck.
     // NUMERICALLY WRONG (only dots first half of d_head). Timing/GFLOPS valid only.
     cl_kernel kernel_flash_attn_f32_f16_j8_dkhalf = nullptr;
+    // SIMT pipeline experiment: q kept in LDS (l_q[BLOCK_M][DK_VEC]) instead of private memory.
+    // Frees ~1024 B/WI private memory; goal is to let o_acc stay in registers and unlock ILP.
+    // Numerically CORRECT (full DK + DV); +16 KB LDS usage (32 KB total).
+    cl_kernel kernel_flash_attn_f32_f16_j8_qlds = nullptr;
+    // FULL_F16 variant: all activations + accumulators (q_priv, o_acc, dot_acc, scores, p, m_i, l_i)
+    // narrowed from float to half. Private memory roughly halves (~2400 -> ~1100 B/WI).
+    // Numerical risk: exp(score-m_max) overflows fp16 if Δscore > ~11.
+    cl_kernel kernel_flash_attn_f32_f16_j8_f16 = nullptr;
+    // Combined Q_IN_LDS + FULL_F16. q moves out of private (~512 B saved) and the
+    // transposed [DK_VEC][BLOCK_M] layout with 8-byte elements gives 0 bank conflicts.
+    cl_kernel kernel_flash_attn_f32_f16_j8_qlds_f16 = nullptr;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -689,10 +705,14 @@ struct ggml_backend_opencl_context {
                 info.evt, CL_PROFILING_COMMAND_COMPLETE, sizeof(cl_ulong), &cmd_complete, NULL));
             CL_CHECK(clReleaseEvent(info.evt));
 
-            char kernel_name[512];
-            CL_CHECK(clGetKernelInfo(info.kernel, CL_KERNEL_FUNCTION_NAME,
-                sizeof(kernel_name), kernel_name, NULL));
-            info.kernel_name = kernel_name;
+            // CLBlast-routed GEMMs have no cl_kernel handle (info.kernel == NULL) and carry a
+            // kernel_name set by the producer; only query the driver for real ggml kernels.
+            if (info.kernel) {
+                char kernel_name[512];
+                CL_CHECK(clGetKernelInfo(info.kernel, CL_KERNEL_FUNCTION_NAME,
+                    sizeof(kernel_name), kernel_name, NULL));
+                info.kernel_name = kernel_name;
+            }
 
             info.cmd_queued = cmd_queued;
             info.cmd_submit = cmd_submit;
@@ -829,6 +849,29 @@ struct ggml_backend_opencl_context {
     cl_program program_CL_gemv_11008_1_4096;
     cl_program program_CL_gemv_32000_1_4096;
     cl_kernel CL_mul_mat_Ab_Bi_8x4;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_f16; // PI0 attention: f16 weights (KV cache) + image B
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_f16_splitk; // PI0 attention: split-K for occupancy-starved AV
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_splitk; // PI0 split-K variant for small-M q4 GEMM
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_globalB; // PI0 bench variant: B via global half* (no texture)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_global; // PI0 probe: stream B only (global), no weights
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_image;  // PI0 probe: stream B only (image), no weights
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_globalB_stagger; // PI0 bench variant: global B, per-lane staggered K start
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Aonly; // PI0 probe: stream weights+dequant only (global), no B
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_nostore; // PI0 probe: full image compute, no dst write-back
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_lowcompute; // PI0 probe: full memory, ~1/4 compute (1 accumulator)
+    cl_kernel CL_fma_peak;                 // PI0 diag E1: pure-FMA throughput microbench (P_fma)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_inject; // PI0 diag E2: production GEMM + injected free-FMA probe
+    cl_kernel CL_mul_mat_Ab_Bi_16x4;       // PI0 diag E5: 16-N tile (2x weight reuse)
+    cl_kernel CL_mul_mat_Ab_Bi_32x4;       // PI0 diag E5: 32-N tile (4x weight reuse)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_aimg;   // PI0 diag E6a: weights via texture (image1d_buffer)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_q4k;    // PI0 q4_K operating point: 8x4 image-B, uint8 sub-scale+min + fp16 super
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_noguard;// PI0 diag E6b: store guards removed
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_unroll; // PI0 diag E6c: K-loop unroll 2
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_image_i8; // PI0 diag: B-only stream as int8 (read-BW test)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_image_f4; // PI0 diag: B-only 128-bit fetch (fetch-width test)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_noread;   // PI0 diag: accumulates only, no B reads (is-read-the-bottleneck test)
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_image_q8; // PI0 diag: B as 8 int8/64-bit fetch (correct q8 packing)
+    cl_kernel kernel_splitk_reduce;        // PI0 split-K partial-sum reduction
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096;
@@ -2000,6 +2043,39 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                         CL_CHECK(clReleaseProgram(prog));
                         GGML_LOG_CONT(".");
                     }
+                    // Q_IN_LDS variant — same shape (DK=DV=256, J=8) but q stored in LDS.
+                    {
+                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=8 -D Q_IN_LDS";
+                        cl_program prog = build_program_from_source(
+                            backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernel_flash_attn_f32_f16_j8_qlds = k;
+                        CL_CHECK(clReleaseProgram(prog));
+                        GGML_LOG_CONT(".");
+                    }
+                    // FULL_F16 variant — same shape (DK=DV=256, J=8) but all accumulators fp16.
+                    {
+                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=8 -D FULL_F16";
+                        cl_program prog = build_program_from_source(
+                            backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernel_flash_attn_f32_f16_j8_f16 = k;
+                        CL_CHECK(clReleaseProgram(prog));
+                        GGML_LOG_CONT(".");
+                    }
+                    // Q_IN_LDS + FULL_F16 combo. Moves q to LDS (transposed) AND uses fp16 everywhere.
+                    {
+                        const std::string OPTS = OPTS_BASE + " -D J_STRIDE=8 -D Q_IN_LDS -D FULL_F16";
+                        cl_program prog = build_program_from_source(
+                            backend_ctx->context, backend_ctx->device, kernel_src_j8.c_str(), OPTS);
+                        cl_kernel k = nullptr;
+                        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16_j8", &err), err));
+                        backend_ctx->kernel_flash_attn_f32_f16_j8_qlds_f16 = k;
+                        CL_CHECK(clReleaseProgram(prog));
+                        GGML_LOG_CONT(".");
+                    }
 
                     // Diagnostic: dump register-spill evidence for d_head=256 path.
                     // CL_KERNEL_PRIVATE_MEM_SIZE > 0 means the compiler allocated
@@ -2034,6 +2110,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                         }
                         dump("flash_attn_f32_f16_j8_dvhalf", backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf);
                         dump("flash_attn_f32_f16_j8_dkhalf", backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf);
+                        dump("flash_attn_f32_f16_j8_qlds",   backend_ctx->kernel_flash_attn_f32_f16_j8_qlds);
+                        dump("flash_attn_f32_f16_j8_f16",    backend_ctx->kernel_flash_attn_f32_f16_j8_f16);
+                        dump("flash_attn_f32_f16_j8_qlds_f16", backend_ctx->kernel_flash_attn_f32_f16_j8_qlds_f16);
                     }
                 }
             }
@@ -2733,6 +2812,29 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #endif
         backend_ctx->program_CL_gemm = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), compile_opts);
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_f16 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_f16", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_f16_splitk = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_f16_splitk", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_splitk = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_splitk", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_globalB = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_globalB", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_global = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_global", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_image", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_globalB_stagger = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_globalB_stagger", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Aonly = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Aonly", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_nostore = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_nostore", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_lowcompute = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_lowcompute", &err), err));
+        CL_CHECK((backend_ctx->CL_fma_peak = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_fma_peak", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_inject = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_inject", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_16x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_16x4", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_32x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_32x4", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_aimg = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_aimg", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4k = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_q4k", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_noguard = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_noguard", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_unroll = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_unroll", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_i8 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_image_i8", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_f4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_image_f4", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_noread = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_noread", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_q8 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_image_q8", &err), err));
+        CL_CHECK((backend_ctx->kernel_splitk_reduce = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_splitk_reduce", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3213,6 +3315,13 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
+
+    { // memory hierarchy probe (coalescing analysis)
+        cl_uint  cl_line = 0; clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_CACHELINE_SIZE, sizeof(cl_line), &cl_line, NULL);
+        cl_ulong cl_l2   = 0; clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_CACHE_SIZE,     sizeof(cl_l2),   &cl_l2,   NULL);
+        GGML_LOG_INFO("ggml_opencl: global mem cacheline: %u bytes ; L2 cache: %llu KB\n",
+                      cl_line, (unsigned long long)(cl_l2/1024));
+    }
 
     clGetDeviceInfo(device, CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, sizeof(size_t), &backend_ctx->image_max_buffer_size, NULL);
     GGML_LOG_INFO("ggml_opencl: device max image buffer size (pixels): %lu\n", backend_ctx->image_max_buffer_size);
@@ -4454,6 +4563,22 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
     return ((elem_num < 128 * 1024 * 1024) && adreno_kernel);  // max element num: 2**27
 }
 
+// PI0 GEMM bench routing: PI0_GEMM_VARIANT selects which q4_0 x f32 GEMM kernel runs,
+// so the texture(image)-vs-global B-load question can be measured with one binary.
+//   (unset)/"abbi" -> kernel_mul_mat_Ab_Bi_8x4         (B via image1d_buffer, default)
+//   "abbi_gb"       -> kernel_mul_mat_Ab_Bi_8x4_globalB (B via plain global half*)
+//   "abbi_gb_stag"  -> kernel_mul_mat_Ab_Bi_8x4_globalB_stagger (global B, per-lane staggered K start)
+//   "l4lm"          -> bypass Adreno path -> mul_mm_q4_0_f32_l4_lm (LDS-tiled)
+// Read per-call (not cached) so a bench can switch between timing loops via setenv().
+// NOTE: also consulted in set_tensor below: when "l4lm" is active at weight-upload
+// time, the q4_0 weights are kept in standard (non-transposed) layout so the LDS
+// kernel reads them correctly. So the bench must set the env BEFORE uploading the
+// l4lm tensor's weights, matching the env used when it later runs the GEMM.
+static bool pi0_gemm_variant_is(const char * s) {
+    const char * v = getenv("PI0_GEMM_VARIANT");
+    return v && v[0] && strcmp(v, s) == 0;
+}
+
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer->buft->device);
 
@@ -4529,7 +4654,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
 
         // The optimized kernels need weights in natural order, so unshuffle.
-        if (use_adreno_kernels(backend_ctx, tensor)) {
+        // PI0 bench: when forcing the LDS (l4lm) kernel, keep the standard shuffled
+        // layout it expects (skip noshuffle + the transpose block below).
+        if (use_adreno_kernels(backend_ctx, tensor) && !pi0_gemm_variant_is("l4lm")) {
             kernel = backend_ctx->kernel_convert_block_q4_0_noshuffle;
         }
     #else
@@ -4553,7 +4680,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Only do transpose for large, non batched matrix
         // TODO: use preallocated images instead of sub-buffer then image
-        if (use_adreno_kernels(backend_ctx, tensor)) {
+        // PI0 bench: skip the Ab_Bi transpose when forcing the LDS (l4lm) kernel.
+        if (use_adreno_kernels(backend_ctx, tensor) && !pi0_gemm_variant_is("l4lm")) {
         // <----------------------------------------------------------------------------------> //
         // start transpose
         // <----------------------------------------------------------------------------------> //
@@ -4809,6 +4937,75 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             transpose_2d_as_16b(backend_ctx, extra->m, extra->m, size_m, K/32, M);
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+        return;
+    }
+    // PI0 q4_K operating point: decode native q4_K on the host into the Adreno-co-designed layout
+    // consumed by kernel_mul_mat_Ab_Bi_8x4_q4k -- transposed quants (the q4_0 fast path) + interleaved
+    // uint8 sub-scale/min + interleaved fp16 super-scale/min. Reuses the q4_1 extra (3 cl_mem:
+    // q=quants, d=sub, m=super). Gated by PI0_GEMM_VARIANT=q4k (bench only; default Q4_K is untouched).
+    if (tensor->type == GGML_TYPE_Q4_K && pi0_gemm_variant_is("q4k")) {
+        const int K = (int)tensor->ne[0];
+        const int M = (int)tensor->ne[1];
+        GGML_ASSERT(K % 256 == 0 && M % 4 == 0);
+        const int nsb = K / 256;                       // super-blocks per row
+        const int njb = K / 32;                        // sub-blocks per row
+        const int m_4 = M / 4;                          // m-tiles
+        const size_t row_size = (size_t)nsb * 144;      // sizeof(block_q4_K) == 144
+
+        std::vector<uint16_t> hq((size_t)(K/4) * M, 0);   // transposed quants [K/4][M], 4 nibbles/ushort
+        std::vector<uint8_t>  hsub((size_t)njb * m_4 * 8); // [K/32][M/4][8]: sub-scale s0..3 + sub-min s4..7
+        std::vector<uint16_t> hsup((size_t)nsb * m_4 * 8); // [K/256][M/4][8]: super-d s0..3 + super-dmin s4..7 (fp16 bits)
+
+        const uint8_t * base = (const uint8_t *) data;
+        for (int mm = 0; mm < M; ++mm) {
+            const uint8_t * row = base + (size_t)mm * row_size;
+            const int mt = mm >> 2;
+            const int ml = mm & 3;
+            for (int b = 0; b < nsb; ++b) {
+                const uint8_t * blk    = row + (size_t)b * 144;
+                const uint16_t d_h     = *(const uint16_t *)(blk + 0);  // ggml_half d
+                const uint16_t dmin_h  = *(const uint16_t *)(blk + 2);  // ggml_half dmin
+                const uint8_t * scales = blk + 4;                       // 12 bytes 6-bit scales/mins
+                const uint8_t * qs     = blk + 16;                      // 128 bytes 4-bit quants
+                const size_t sup_base = ((size_t)b * m_4 + mt) * 8;
+                hsup[sup_base + ml]     = d_h;
+                hsup[sup_base + 4 + ml] = dmin_h;
+                for (int sb = 0; sb < 8; ++sb) {                        // get_scale_min_k4
+                    uint8_t sc, mn;
+                    if (sb < 4) { sc = scales[sb] & 63; mn = scales[sb + 4] & 63; }
+                    else { sc = (scales[sb+4] & 0xF) | ((scales[sb-4] >> 6) << 4);
+                           mn = (scales[sb+4] >>  4) | ((scales[sb  ] >> 6) << 4); }
+                    const int jb = b * 8 + sb;
+                    const size_t sub_base = ((size_t)jb * m_4 + mt) * 8;
+                    hsub[sub_base + ml]     = sc;
+                    hsub[sub_base + 4 + ml] = mn;
+                }
+                for (int e = 0; e < 256; ++e) {                         // nibbles -> transposed quants
+                    const int k = b * 256 + e;
+                    const int c = e / 64;
+                    const int l = e % 32;
+                    const uint8_t byte = qs[c*32 + l];
+                    const uint8_t nib = ((e % 64) < 32) ? (byte & 0xF) : (byte >> 4);
+                    hq[(size_t)(k >> 2) * M + mm] |= (uint16_t)nib << (4 * (k & 3));
+                }
+            }
+        }
+
+        ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        ggml_tensor_extra_cl_q4_1 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_1();
+        extra->reset();  // release any recycled buffers before re-creating
+        cl_int err;
+        const size_t sz_q   = hq.size()   * sizeof(uint16_t);
+        const size_t sz_sub = hsub.size() * sizeof(uint8_t);
+        const size_t sz_sup = hsup.size() * sizeof(uint16_t);
+        extra->q = clCreateBuffer(context, CL_MEM_READ_ONLY, sz_q,   NULL, &err); CL_CHECK(err);
+        extra->d = clCreateBuffer(context, CL_MEM_READ_ONLY, sz_sub, NULL, &err); CL_CHECK(err);
+        extra->m = clCreateBuffer(context, CL_MEM_READ_ONLY, sz_sup, NULL, &err); CL_CHECK(err);
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, sz_q,   hq.data(),   0, NULL, NULL));
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, sz_sub, hsub.data(), 0, NULL, NULL));
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->m, CL_TRUE, 0, sz_sup, hsup.data(), 0, NULL, NULL));
+        extra->size_q = sz_q; extra->size_d = sz_sub; extra->size_m = sz_sup;
+        tensor->extra = extra;
         return;
     }
     if (tensor->type == GGML_TYPE_MXFP4) {
@@ -8836,10 +9033,28 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     if (on) fprintf(stderr, "FA-DKHALF: WARNING numerically wrong, timing-only probe\n");
                     return on;
                 }();
+                static const bool q_lds = []{
+                    const char * e = getenv("GGML_OPENCL_FA_QLDS");
+                    bool on = e && atoi(e) != 0;
+                    if (on) fprintf(stderr, "FA-QLDS: q in LDS variant (numerically correct)\n");
+                    return on;
+                }();
+                static const bool full_f16 = []{
+                    const char * e = getenv("GGML_OPENCL_FA_F16");
+                    bool on = e && atoi(e) != 0;
+                    if (on) fprintf(stderr, "FA-F16: all accumulators in fp16 (may lose precision)\n");
+                    return on;
+                }();
                 if (dv_half && backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf) {
                     j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_dvhalf;
                 } else if (dk_half && backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf) {
                     j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_dkhalf;
+                } else if (q_lds && backend_ctx->kernel_flash_attn_f32_f16_j8_qlds) {
+                    j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_qlds;
+                } else if (q_lds && full_f16 && backend_ctx->kernel_flash_attn_f32_f16_j8_qlds_f16) {
+                    j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_qlds_f16;
+                } else if (full_f16 && backend_ctx->kernel_flash_attn_f32_f16_j8_f16) {
+                    j_kernel = backend_ctx->kernel_flash_attn_f32_f16_j8_f16;
                 } else {
                     auto it = backend_ctx->kernels_flash_attn_f32_f16_jstride.find(fa_j_mode);
                     if (it != backend_ctx->kernels_flash_attn_f32_f16_jstride.end()) {
@@ -9358,7 +9573,10 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q4_1_f32;
+        // PI0: the q4_K operating point reuses this q4_1 GEMM dispatch (identical {q,d,m} extra
+        // layout + B-transpose); it just swaps in the uint8-sub-scale q4_K kernel when q4k is set.
+        kernel = pi0_gemm_variant_is("q4k") ? backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4k
+                                            : backend_ctx->kernel_gemm_noshuffle_q4_1_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_1->q));
@@ -9857,6 +10075,10 @@ static bool ggml_cl_mul_mat_rt_dp8(
     return true;
 }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+#include "pi0_attn.cpp" // PI0 attention image-B GEMM (opt-in PI0_ATTN_IMG=1)
+#endif
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // PI0 Q8_0 RT dp8 path takes precedence if src0 has been registered.
     {
@@ -9925,6 +10147,54 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     GGML_ASSERT(ne00 == ne10);
 
+#ifdef GGML_OPENCL_USE_CLBLAST
+    // PI0 experiment: route PI0's two *standard-attention* batched GEMMs (KQ and KQV)
+    // through CLBlast instead of the generic Adreno image GEMM. We isolate PI0's LLM/expert
+    // attention by its GQA shape: n_kv_head=1 vs n_head=8 => r2 = ne12/ne02 = 8 (> 1).
+    //   - FFN/projection matmuls have a 2D src1 (ne12 == 1) -> excluded.
+    //   - The SigLIP/CLIP ViT uses full MHA (n_head == n_kv_head => r2 == 1) -> excluded,
+    //     so the vision encoder is NOT diverted onto this (un-validated-for-ViT) path.
+    // Opt-in at runtime (PI0_ATTN_CLBLAST=1) so A/B needs no rebuild; default OFF leaves
+    // the native path byte-for-byte unchanged. CLBLAST_GEMM returns on success and falls
+    // through to the native kernels on any failure (e.g. CLBlast bails on N == 1).
+    //
+    // Measured split (8 Elite / Adreno 830): CLBlast WINS the prefix attention (n_q=769,
+    // run once, compute-bound: -10%) but LOSES the expert attention (n_q=51, run 10x:
+    // +60%, dominated by per-call GemmBatched host overhead on tiny shapes). PI0_ATTN_CLBLAST_MINQ
+    // sets a minimum n_q (= ne11) to divert: set it to e.g. 256 to take only the prefix and
+    // leave the tiny expert attention on the native kernel. Default 0 = divert all attention.
+    {
+        static const bool pi0_attn_clblast = []{
+            const char * e = getenv("PI0_ATTN_CLBLAST");
+            return e && e[0] == '1';
+        }();
+        static const int pi0_attn_clblast_minq = []{
+            const char * e = getenv("PI0_ATTN_CLBLAST_MINQ");
+            return e ? atoi(e) : 0;
+        }();
+        if (pi0_attn_clblast && ne12 > 1 && r2 > 1 && ne11 >= pi0_attn_clblast_minq &&
+            src1t == GGML_TYPE_F32 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+            const int batch_stride_a = ne00 * ne01;
+            const int batch_stride_b = ne10 * ne11;
+            const int batch_stride_d = ne0  * ne1;
+            pi0_clblast_apply_tuning(backend_ctx->device);
+            if (src0t == GGML_TYPE_F16) {
+                CLBLAST_GEMM(clblast_gemm_f16_f32_f32, ne01, ne11, ne10, ne12, ne13, r2, r3,
+                             extra0->data_device, offset0, ne00, batch_stride_a,
+                             extra1->data_device, offset1, ne10, batch_stride_b,
+                             extrad->data_device, offsetd, ne01, batch_stride_d);
+            } else if (src0t == GGML_TYPE_F32) {
+                CLBLAST_GEMM(clblast_gemm_f32_f32_f32, ne01, ne11, ne10, ne12, ne13, r2, r3,
+                             extra0->data_device, offset0, ne00, batch_stride_a,
+                             extra1->data_device, offset1, ne10, batch_stride_b,
+                             extrad->data_device, offsetd, ne01, batch_stride_d);
+            }
+        }
+    }
+#endif
+
     int nth0 = 32;
     int nth1 = 1;
     int nrows = 1;
@@ -9935,6 +10205,109 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     cl_context context = backend_ctx->context;
+
+    // PI0 attention (Phase B): route collapsed QK / AV through the f16-weight image-B kernel.
+    // Opt-in PI0_ATTN_IMG=1; gated to PI0 attention shapes only (see pi0_attn.cpp).
+    if (pi0_attn_img_eligible(src0, src1, dst)) {
+        ggml_cl_mul_mat_pi0_attn_img(backend, src0, src1, dst);
+        return;
+    }
+
+    // PI0 ViT (SigLIP) proj/FFN: route f16xf32 2D GEMMs through the same f16 image-B kernel (no quant
+    // -> zero parity risk). Opt-in PI0_VIT_IMG=1 (see pi0_attn.cpp). Default off -> unchanged.
+    if (pi0_vit_img_eligible(src0, src1, dst)) {
+        ggml_cl_mul_mat_pi0_attn_img(backend, src0, src1, dst);
+        return;
+    }
+
+    // PI0 attention probe (Phase A): f16-weight Ab_Bi (image B). Routes f16xf32 GEMMs through the
+    // texture-cache kernel to measure the attention-GEMM ceiling with f16 KV (the "weights"). Placed
+    // BEFORE use_adreno_kernels (which requires ne00,ne01>=512 and would reject head_dim=256). Opt-in
+    // via PI0_GEMM_VARIANT=abbi_f16 so default behavior is byte-for-byte unchanged. The weights must
+    // be in the M-contiguous [K][M] transposed layout the kernel expects (uploaded so by the bench).
+    if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && pi0_gemm_variant_is("abbi_f16") &&
+        ne1 > 1 && ne01 % 4 == 0 && ne02 == 1 && ne03 == 1) {
+        cl_int           status;
+        cl_buffer_region region;
+        const int M = ne01, N = ne1, K = ne00;
+
+        // A: f16 weights, [K][M] M-contiguous. Sub-buffer at the tensor's offset.
+        region.origin = offset0;
+        region.size   = (size_t) K * M * sizeof(ggml_fp16_t);
+        cl_mem A_sub = clCreateSubBuffer(extra0->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+        CL_CHECK(status);
+
+        // B: f32 activations -> transpose + convert to the f16 "Bi" image (identical to q4_0 path).
+        region.origin = offset1;
+        region.size   = (size_t) K * N * sizeof(float);
+        cl_mem B_sub = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+        CL_CHECK(status);
+
+        const int extra_elements = N % 8;
+        const int padding = extra_elements > 0 ? 8 - extra_elements : 0;
+
+        region.origin = 0;
+        region.size   = (size_t) K * (N + padding) * sizeof(float) / 2; // /2 for FP16
+        backend_ctx->prealloc_act_trans.allocate(context, region.size);
+        cl_mem B_d = clCreateSubBuffer(backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+        CL_CHECK(status);
+
+        cl_image_format fmt_in  = { CL_RGBA, CL_FLOAT };
+        cl_image_desc   desc_in = { CL_MEM_OBJECT_IMAGE1D_BUFFER, (size_t)(K * N / 4), 0,0,0,0,0,0,0, { B_sub } };
+        cl_mem B_in_img = clCreateImage(context, 0, &fmt_in, &desc_in, NULL, &status);
+        CL_CHECK(status);
+
+        cl_image_format fmt_out  = { CL_RGBA, CL_HALF_FLOAT };
+        cl_image_desc   desc_out = { CL_MEM_OBJECT_IMAGE1D_BUFFER, (size_t)(K * (N + padding) / 4), 0,0,0,0,0,0,0, { B_d } };
+        cl_mem B_image1d = clCreateImage(context, 0, &fmt_out, &desc_out, NULL, &status);
+        CL_CHECK(status);
+
+        int height_B = N / 4; if (height_B == 0) { height_B = 1; }
+        int width_B  = K / 4;
+        int padded_height_B = (N + padding) / 4;
+        {
+            cl_kernel tk = backend_ctx->kernel_transpose_32_16;
+            CL_CHECK(clSetKernelArg(tk, 0, sizeof(cl_mem), &B_in_img));
+            CL_CHECK(clSetKernelArg(tk, 1, sizeof(cl_mem), &B_image1d));
+            CL_CHECK(clSetKernelArg(tk, 2, sizeof(int),    &height_B));
+            CL_CHECK(clSetKernelArg(tk, 3, sizeof(int),    &width_B));
+            CL_CHECK(clSetKernelArg(tk, 4, sizeof(int),    &padded_height_B));
+            size_t tl[2] = { 1, 16 };
+            size_t tg[2] = { (size_t) width_B, (size_t) padded_height_B };
+            backend_ctx->enqueue_ndrange_kernel(tk, 2, tg, tl, dst);
+        }
+
+        region.origin = offsetd;
+        region.size   = (size_t) M * N * sizeof(float);
+        cl_mem C_d = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+        CL_CHECK(status);
+
+        const int padded_N = N + padding;
+        cl_kernel fk = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f16;
+        CL_CHECK(clSetKernelArg(fk, 0, sizeof(cl_mem), &A_sub));
+        CL_CHECK(clSetKernelArg(fk, 1, sizeof(cl_mem), &B_image1d));
+        CL_CHECK(clSetKernelArg(fk, 2, sizeof(cl_mem), &C_d));
+        CL_CHECK(clSetKernelArg(fk, 3, sizeof(int),    &ne01));
+        CL_CHECK(clSetKernelArg(fk, 4, sizeof(int),    &padded_N));
+        CL_CHECK(clSetKernelArg(fk, 5, sizeof(int),    &ne00));
+        CL_CHECK(clSetKernelArg(fk, 6, sizeof(int),    &ne1));
+
+        // 1D-flattened launch (matches kernel_mul_mat_Ab_Bi_8x4_f16): total = ceil(N/8)*ceil(M/4).
+        const size_t f_mtiles = (size_t) ((ne01 + 3) / 4);
+        const size_t f_ntiles = (size_t) ((ne1  + 7) / 8);
+        const size_t f_total  = f_mtiles * f_ntiles;
+        size_t gws[1] = { ((f_total + 127) / 128) * 128 };
+        size_t lws[1] = { 128 };
+        backend_ctx->enqueue_ndrange_kernel(fk, 1, gws, lws, dst);
+
+        CL_CHECK(clReleaseMemObject(A_sub));
+        CL_CHECK(clReleaseMemObject(B_sub));
+        CL_CHECK(clReleaseMemObject(B_d));
+        CL_CHECK(clReleaseMemObject(B_in_img));
+        CL_CHECK(clReleaseMemObject(B_image1d));
+        CL_CHECK(clReleaseMemObject(C_d));
+        return;
+    }
 
     if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32){
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
@@ -9961,7 +10334,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
     }
 
-    if (ne01 && ne1 && use_adreno_kernels(backend_ctx, src0)) {
+    if (ne01 && ne1 && use_adreno_kernels(backend_ctx, src0) &&
+        !(src0t == GGML_TYPE_Q4_0 && pi0_gemm_variant_is("l4lm"))) { // PI0 bench: force LDS path
 
     // init CL objects
     // <--------------------------------------------> //
@@ -9971,6 +10345,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_buffer_region    region;
     cl_mem              A_image1d = nullptr;
     cl_mem              B_image1d = nullptr;
+    cl_mem              B_image1d_i8 = nullptr; // PI0 probe: int8 view of B (read-BW test)
+    cl_mem              B_image1d_f4 = nullptr; // PI0 probe: 128-bit float4 view of B (fetch-width test)
+    cl_mem              B_image1d_q8 = nullptr; // PI0 probe: RGBA-int16 view (8 int8/64-bit fetch)
     cl_mem              B_sub_buffer = nullptr;
     cl_mem              C_d = nullptr;
     // for B transpose
@@ -9996,6 +10373,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             return;
     }
 
+    // PI0 q4_K operating point x fp32: routes through the q4_1 GEMM dispatch (src0->extra is a
+    // q4_1 extra filled by the host-side q4_K decode in set_tensor); swaps in the q4_K kernel.
+    if (src0t == GGML_TYPE_Q4_K && src1t == GGML_TYPE_F32 && pi0_gemm_variant_is("q4k")) {
+            ggml_cl_mul_mat_q4_1_f32_adreno(backend, src0, src1, dst);
+            return;
+    }
+
     // q8_0 x fp32
     if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
         enable_adreno_trans_weight(backend_ctx, src0)) {
@@ -10009,7 +10393,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // create an image for A
         // <--------------------------------------------> //
-        if (N == 1) {
+        if (N == 1 || pi0_gemm_variant_is("aimg")) { // E6a reads weights as uint32 texels
             img_fmt_1d = { CL_R, CL_UNSIGNED_INT32};
         } else {
             img_fmt_1d = { CL_R, CL_FLOAT};
@@ -10097,6 +10481,43 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 &status);
             CL_CHECK(status);
 
+            // PI0 probe: an int8 view over the SAME B_d buffer (same texel count K*(N+pad)/4, but
+            // 4 bytes/texel vs 8 -> half the B bytes). Garbage data (aliases f16 bits); timing only.
+            if (pi0_gemm_variant_is("bonly_i8")) {
+                cl_image_format fmt_i8 = { CL_RGBA, CL_SIGNED_INT8 };
+                cl_image_desc desc_i8 = {
+                    CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                    static_cast<size_t>(K * (N + padding)/4),
+                    0, 0, 0, 0, 0, 0, 0, { B_d }
+                };
+                B_image1d_i8 = clCreateImage(context, 0, &fmt_i8, &desc_i8, NULL, &status);
+                CL_CHECK(status);
+            }
+            // PI0 probe: 128-bit float4 view over the SAME B_d (8 halfs/texel -> half the fetches
+            // of half4). Same bytes; tests the image->TP-L1 fetch width. Timing only.
+            if (pi0_gemm_variant_is("bonly_f4")) {
+                cl_image_format fmt_f4 = { CL_RGBA, CL_FLOAT };
+                cl_image_desc desc_f4 = {
+                    CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                    static_cast<size_t>(K * (N + padding)/8),
+                    0, 0, 0, 0, 0, 0, 0, { B_d }
+                };
+                B_image1d_f4 = clCreateImage(context, 0, &fmt_f4, &desc_f4, NULL, &status);
+                CL_CHECK(status);
+            }
+            // PI0 probe: RGBA-int16 view (64-bit texel = 8 int8 = 8 N) over the SAME B_d. 8 N per
+            // ONE 64-bit fetch (vs half4's 4 N) -> half the fetches. Same bytes; tests correct q8.
+            if (pi0_gemm_variant_is("bonly_q8")) {
+                cl_image_format fmt_q8 = { CL_RGBA, CL_SIGNED_INT16 };
+                cl_image_desc desc_q8 = {
+                    CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                    static_cast<size_t>(K * (N + padding)/8),
+                    0, 0, 0, 0, 0, 0, 0, { B_d }
+                };
+                B_image1d_q8 = clCreateImage(context, 0, &fmt_q8, &desc_q8, NULL, &status);
+                CL_CHECK(status);
+            }
+
             int height_B = N/4;
             if (height_B == 0) {
                 height_B = 1;
@@ -10167,6 +10588,42 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             } else if (M == 32000 && K == 4096) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
             }
+        } else if (pi0_gemm_variant_is("abbi_gb")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_globalB; // B via plain global half*
+        } else if (pi0_gemm_variant_is("abbi_gb_stag")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_globalB_stagger; // global B, per-lane staggered K start
+        } else if (pi0_gemm_variant_is("bonly_g")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_global; // stream B only (global), no weights
+        } else if (pi0_gemm_variant_is("bonly_i")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image;  // stream B only (image), no weights
+        } else if (pi0_gemm_variant_is("aonly")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Aonly; // stream weights+dequant only, no B
+        } else if (pi0_gemm_variant_is("abbi_nostore")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_nostore; // full image compute, no dst write-back
+        } else if (pi0_gemm_variant_is("lowcompute")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_lowcompute; // full memory, ~1/4 compute
+        } else if (pi0_gemm_variant_is("fma_peak")) {
+            kernel = backend_ctx->CL_fma_peak; // E1: pure-FMA microbench (ignores A/B)
+        } else if (pi0_gemm_variant_is("inject")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_inject; // E2: GEMM + injected free-FMA probe
+        } else if (pi0_gemm_variant_is("n16")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_16x4; // E5: 16-N tile
+        } else if (pi0_gemm_variant_is("n32")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_32x4; // E5: 32-N tile
+        } else if (pi0_gemm_variant_is("aimg")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_aimg; // E6a: weights via texture
+        } else if (pi0_gemm_variant_is("noguard")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_noguard; // E6b: no store guards
+        } else if (pi0_gemm_variant_is("unroll")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_unroll; // E6c: K-loop unroll 2
+        } else if (pi0_gemm_variant_is("bonly_i8")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_i8; // B-only int8 read-BW test
+        } else if (pi0_gemm_variant_is("bonly_f4")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_f4; // B-only 128-bit fetch-width test
+        } else if (pi0_gemm_variant_is("bonly_noread")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_noread; // accumulates only, no B reads
+        } else if (pi0_gemm_variant_is("bonly_q8")) {
+            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_q8; // 8 int8/64-bit fetch
         } else {
             kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4;
         }
@@ -10200,14 +10657,25 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
             int padded_N = ne1 + padding;
 
-            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q4_0->q)); //A_q_dextra0_q4_0->q
+            // globalB variant reads the SAME transposed f16 bytes via the plain backing
+            // buffer (B_d) instead of the image1d_buffer view (B_image1d) -> isolates texture path.
+            cl_mem B_arg = (pi0_gemm_variant_is("abbi_gb") || pi0_gemm_variant_is("bonly_g") || pi0_gemm_variant_is("abbi_gb_stag") || pi0_gemm_variant_is("aonly")) ? B_d : B_image1d;
+            if (pi0_gemm_variant_is("bonly_i8")) B_arg = B_image1d_i8; // int8 B view (half bytes)
+            if (pi0_gemm_variant_is("bonly_f4")) B_arg = B_image1d_f4; // 128-bit B view (half fetches)
+            if (pi0_gemm_variant_is("bonly_q8")) B_arg = B_image1d_q8; // RGBA-int16 (8 int8/64-bit)
+            cl_mem A_arg = pi0_gemm_variant_is("aimg") ? A_image1d : extra0_q4_0->q; // E6a: weights via texture
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &A_arg)); //A_q (buffer) or A_image1d (E6a)
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra0_q4_0->d)); //A_s_d
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_image1d)); //B_d
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_arg)); //B image (default) or plain buffer (globalB)
             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &C_d)); //C_d
             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),    &ne01)); //M
             CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),    &padded_N)); //N with padding
             CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),    &ne00)); //K
             CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),    &ne1)); //N without padding
+            if (pi0_gemm_variant_is("inject")) {
+                int inj = 0; const char * e = getenv("PI0_GEMM_INJECT"); if (e) inj = atoi(e);
+                CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &inj)); // E2: injected free-FMA count
+            }
         }
         // <--------------------------------------------> //
 
@@ -10218,6 +10686,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         size_t local_work_size[3] = {64, 2, 4};
 
         global_work_size[0] = (size_t)(ceil((float)ne1/8));
+        if (pi0_gemm_variant_is("n16")) global_work_size[0] = (size_t)(ceil((float)ne1/16)); // E5
+        if (pi0_gemm_variant_is("n32")) global_work_size[0] = (size_t)(ceil((float)ne1/32)); // E5
+        // Probe A: divide the N-tile grid (gy) to emulate larger N_tile (more weight reuse) at
+        // NEUTRAL occupancy. aonly+GYDIV=2 -> half the weight re-reads -> ~0.5x iff weight-traffic-bound.
+        { const char* e = getenv("PI0_GEMM_GYDIV"); int d = e ? atoi(e) : 1;
+          if (d > 1) global_work_size[0] = (size_t)((global_work_size[0] + d - 1) / d); }
         global_work_size[1] = (size_t)(ne01/4);
         global_work_size[2] = (size_t)(1);
 
@@ -10240,6 +10714,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             local_work_size[1] = 64;
         }
 
+        // PI0 bench (hot-bank probe): override workgroup shape so a 128-lane wave spans
+        // LWS0 distinct gy -> LWS0 distinct B addresses (128/LWS0 lanes share each).
+        // Result is identical (each fiber computes its own (gy,gx) tile); only the
+        // B-address sharing per wave changes. Applies to abbi (image) and abbi_gb (global)
+        // alike, so their differing sensitivity isolates the same-address/hot-bank effect.
+        { const char * e = getenv("PI0_GEMM_LWS0");
+          if (e && e[0]) { int l0 = atoi(e);
+            if (l0 >= 1 && l0 <= 128 && (128 % l0) == 0) {
+                local_work_size[0] = (size_t)l0;
+                local_work_size[1] = (size_t)(128 / l0);
+            } } }
+
         if (N == 1) {
             size_t wavesize = backend_ctx->adreno_wave_size;
             local_work_size[0] = wavesize; // localsize
@@ -10254,7 +10740,48 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // enqueue kernel with profiling
         // <--------------------------------------------> //
-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        // PI0 split-K: small-M q4 GEMMs (e.g. down/o_proj M=1024 at N=51) launch only
+        // 7*M/512 workgroups → GPU starved. Split K into k_split slices (extra grid dim)
+        // → k_split× more concurrent workgroups, then sum the partials. Opt-in via PI0_SPLITK.
+        static int pi0_splitk = -1;
+        if (pi0_splitk < 0) { const char * e = getenv("PI0_SPLITK"); pi0_splitk = (e && e[0] == '1') ? 1 : 0; }
+        int k_split = 1;
+        if (pi0_splitk && ne1 > 1 && ne01 <= 1024 && ne00 >= 2048 && (ne00 % 128 == 0)) {
+            k_split = 4; // k/k_split is then a multiple of 32 (scale-block aligned)
+        }
+        if (k_split > 1) {
+            const int splitk_padded_N = (int)(ne1 + padding);
+            const int splitk_plane    = (int)(ne01 * ne1);
+            cl_int sk_st;
+            cl_mem partials = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                (size_t) k_split * splitk_plane * sizeof(float), NULL, &sk_st);
+            CL_CHECK(sk_st);
+            cl_kernel sk = backend_ctx->CL_mul_mat_Ab_Bi_8x4_splitk;
+            CL_CHECK(clSetKernelArg(sk, 0, sizeof(cl_mem), &extra0_q4_0->q));
+            CL_CHECK(clSetKernelArg(sk, 1, sizeof(cl_mem), &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(sk, 2, sizeof(cl_mem), &B_image1d));
+            CL_CHECK(clSetKernelArg(sk, 3, sizeof(cl_mem), &partials));
+            CL_CHECK(clSetKernelArg(sk, 4, sizeof(int),    &ne01));
+            CL_CHECK(clSetKernelArg(sk, 5, sizeof(int),    &splitk_padded_N));
+            CL_CHECK(clSetKernelArg(sk, 6, sizeof(int),    &ne00));
+            CL_CHECK(clSetKernelArg(sk, 7, sizeof(int),    &ne1));
+            CL_CHECK(clSetKernelArg(sk, 8, sizeof(int),    &k_split));
+            size_t sk_gws[3] = { (size_t) ceil((float) ne1 / 8), (size_t)(ne01 / 4), (size_t) k_split };
+            size_t sk_lws[3] = { 1, 128, 1 };
+            backend_ctx->enqueue_ndrange_kernel(sk, 3, sk_gws, sk_lws, dst);
+
+            cl_kernel rk = backend_ctx->kernel_splitk_reduce;
+            CL_CHECK(clSetKernelArg(rk, 0, sizeof(cl_mem), &partials));
+            CL_CHECK(clSetKernelArg(rk, 1, sizeof(cl_mem), &C_d));
+            CL_CHECK(clSetKernelArg(rk, 2, sizeof(int),    &splitk_plane));
+            CL_CHECK(clSetKernelArg(rk, 3, sizeof(int),    &k_split));
+            size_t rd_gws[1] = { (size_t)(((splitk_plane + 63) / 64) * 64) };
+            size_t rd_lws[1] = { 64 };
+            backend_ctx->enqueue_ndrange_kernel(rk, 1, rd_gws, rd_lws, dst);
+            clReleaseMemObject(partials);
+        } else {
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        }
         // <--------------------------------------------> //
 
         // deallocate sub buffers and images
@@ -10262,6 +10789,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         CL_CHECK(clReleaseMemObject(A_image1d));
         CL_CHECK(clReleaseMemObject(B_sub_buffer));
         CL_CHECK(clReleaseMemObject(B_image1d));
+        if (B_image1d_i8) CL_CHECK(clReleaseMemObject(B_image1d_i8));
+        if (B_image1d_f4) CL_CHECK(clReleaseMemObject(B_image1d_f4));
+        if (B_image1d_q8) CL_CHECK(clReleaseMemObject(B_image1d_q8));
 
         if (N != 1) {
             CL_CHECK(clReleaseMemObject(B_d));

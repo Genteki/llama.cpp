@@ -69,6 +69,33 @@ void embd_lookup_f32(ggml_tensor * t, int token_id, float * out) {
                    (size_t) t->nb[1], row_bytes);
     }
 
+    // The embedding table lives on the (OpenCL) device. A per-token ggml_backend_tensor_get of ONE
+    // row is pathological on the Adreno q4_0 path (ggml-opencl get_tensor de-transposes + reads back
+    // the ENTIRE ~262MB table every call ≈ 440ms). Read the whole table to a host copy ONCE, then
+    // index it on CPU. The table is stable for the process, so a static per-tensor cache is safe.
+    static const bool cache_disabled = [] { const char * e = getenv("PI0_EMBD_CACHE"); return e && e[0] == '0'; }();
+    static std::map<const ggml_tensor *, std::vector<uint8_t>> host_cache;
+    if (!cache_disabled) {
+        auto it = host_cache.find(t);
+        if (it == host_cache.end()) {
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            it = host_cache.emplace(t, std::move(buf)).first;
+        }
+        const uint8_t * row = it->second.data() + (size_t) token_id * row_bytes;
+        if (t->type == GGML_TYPE_F32) { memcpy(out, row, row_bytes); return; }
+        if (t->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * h = (const ggml_fp16_t *) row;
+            for (int64_t j = 0; j < n_embd; j++) out[j] = ggml_fp16_to_fp32(h[j]);
+            return;
+        }
+        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+        if (!tt || !tt->to_float) GGML_ABORT("embd_lookup_f32: type %s has no dequantizer", ggml_type_name(t->type));
+        tt->to_float(row, out, n_embd);
+        return;
+    }
+
+    // PI0_EMBD_CACHE=0: original per-row device read (slow, for A/B verification).
     if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, out, (size_t) token_id * row_bytes, row_bytes);
         return;
@@ -79,11 +106,8 @@ void embd_lookup_f32(ggml_tensor * t, int token_id, float * out) {
         for (int64_t j = 0; j < n_embd; j++) out[j] = ggml_fp16_to_fp32(tmp[j]);
         return;
     }
-
     const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-    if (!tt || !tt->to_float) {
-        GGML_ABORT("embd_lookup_f32: type %s has no dequantizer", ggml_type_name(t->type));
-    }
+    if (!tt || !tt->to_float) GGML_ABORT("embd_lookup_f32: type %s has no dequantizer", ggml_type_name(t->type));
     std::vector<uint8_t> raw(row_bytes);
     ggml_backend_tensor_get(t, raw.data(), (size_t) token_id * row_bytes, row_bytes);
     tt->to_float(raw.data(), out, n_embd);
@@ -176,9 +200,13 @@ bool load_pi0_model(pi0_model & m, const char * pali_path, const char * expert_p
         auto & l = m.pali_layers[il];
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", il);   l.attn_norm = get_tensor(m.ctx_pali, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", il);    l.ffn_norm  = get_tensor(m.ctx_pali, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", il);      l.q_proj    = get_tensor(m.ctx_pali, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", il);      l.k_proj    = get_tensor(m.ctx_pali, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", il);      l.v_proj    = get_tensor(m.ctx_pali, name);
+        // Fused QKV (one [in, n_head*hd + 2*kv_dim] weight) if present; else separate q/k/v.
+        snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", il);    l.qkv_proj  = ggml_get_tensor(m.ctx_pali, name);
+        if (!l.qkv_proj) {
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", il);  l.q_proj    = get_tensor(m.ctx_pali, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_k.weight", il);  l.k_proj    = get_tensor(m.ctx_pali, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", il);  l.v_proj    = get_tensor(m.ctx_pali, name);
+        }
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", il); l.o_proj    = get_tensor(m.ctx_pali, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", il);    l.gate_proj = get_tensor(m.ctx_pali, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", il);      l.up_proj   = get_tensor(m.ctx_pali, name);
@@ -194,9 +222,13 @@ bool load_pi0_model(pi0_model & m, const char * pali_path, const char * expert_p
         auto & l = m.expert_layers[il];
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", il);   l.attn_norm = get_tensor(m.ctx_expert, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", il);    l.ffn_norm  = get_tensor(m.ctx_expert, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", il);      l.q_proj    = get_tensor(m.ctx_expert, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", il);      l.k_proj    = get_tensor(m.ctx_expert, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", il);      l.v_proj    = get_tensor(m.ctx_expert, name);
+        // Fused QKV (one [in, n_head*hd + 2*kv_dim] weight) if present; else separate q/k/v.
+        snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", il);    l.qkv_proj  = ggml_get_tensor(m.ctx_expert, name);
+        if (!l.qkv_proj) {
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", il);  l.q_proj    = get_tensor(m.ctx_expert, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_k.weight", il);  l.k_proj    = get_tensor(m.ctx_expert, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", il);  l.v_proj    = get_tensor(m.ctx_expert, name);
+        }
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", il); l.o_proj    = get_tensor(m.ctx_expert, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", il);    l.gate_proj = get_tensor(m.ctx_expert, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", il);      l.up_proj   = get_tensor(m.ctx_expert, name);
@@ -233,8 +265,10 @@ void free_pi0_model(pi0_model & m) {
 static ggml_tensor * apply_rope(ggml_context * ctx, ggml_tensor * x, ggml_tensor * positions,
                                 int n_head, int head_dim) {
     ggml_tensor * reshaped = ggml_reshape_3d(ctx, x, head_dim, n_head, x->ne[1]);
+    // Gemma uses NEOX-style RoPE (rotate split halves: x1,x2 = split(x); openpi
+    // gemma._apply_rope), NOT the interleaved GGML_ROPE_TYPE_NORMAL.
     ggml_tensor * roped = ggml_rope_ext(ctx, reshaped, positions, nullptr,
-        head_dim, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        head_dim, GGML_ROPE_TYPE_NEOX, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     return ggml_reshape_2d(ctx, roped, n_head * head_dim, x->ne[1]);
 }
 
@@ -267,9 +301,20 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
     ggml_tensor * x = ggml_rms_norm(ctx, input, 1e-6f);
     x = ggml_mul(ctx, x, w.attn_norm);
 
-    ggml_tensor * q = ggml_mul_mat(ctx, w.q_proj, x);
-    ggml_tensor * k = ggml_mul_mat(ctx, w.k_proj, x);
-    ggml_tensor * v = ggml_mul_mat(ctx, w.v_proj, x);
+    ggml_tensor * q, * k, * v;
+    if (w.qkv_proj) {
+        // Fused QKV: one GEMM (large M=n_head*hd+2*kv_dim → more workgroups, one launch),
+        // then split + cont (apply_rope/cpy need contiguous). q/k/v share the same x.
+        const int q_dim = n_head * head_dim;
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w.qkv_proj, x);            // [q_dim+2*kv_dim, seq] f32
+        q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim,  seq_len, qkv->nb[1], 0));
+        k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, seq_len, qkv->nb[1], (size_t) q_dim          * sizeof(float)));
+        v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, seq_len, qkv->nb[1], (size_t)(q_dim + kv_dim) * sizeof(float)));
+    } else {
+        q = ggml_mul_mat(ctx, w.q_proj, x);
+        k = ggml_mul_mat(ctx, w.k_proj, x);
+        v = ggml_mul_mat(ctx, w.v_proj, x);
+    }
 
     q = apply_rope(ctx, q, positions, n_head, head_dim);
     k = apply_rope(ctx, k, positions, n_kv_head, head_dim);
@@ -311,14 +356,16 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
 
     ggml_tensor * attn_out;
     if (use_flash_attn) {
-        // PI0_FIX_Q_LAYOUT=1: permute q from [head_dim, n_head, seq_len] (PI0's quirk)
-        // to standard [head_dim, seq_len, n_head] before passing to flash_attn_ext.
-        // Without this, flash_attn dispatch misreads ne[1]/ne[2] (n_q vs n_head swap),
-        // launches with 50% SIMT utilization and 2.4× extra WGs — ~3× slowdown.
+        // Permute q from [head_dim, n_head, seq_len] (PI0's quirk) to the standard
+        // [head_dim, seq_len, n_head] that flash_attn_ext expects. This is REQUIRED
+        // for CORRECTNESS: without it flash_attn misreads ne[1]/ne[2] (n_q vs n_head
+        // swap), producing wrong attention (PaliGemma prefix_out cos ~0.44 vs the
+        // reference) as well as a ~3× GPU slowdown. Default ON; PI0_FIX_Q_LAYOUT=0
+        // restores the old (broken) behavior for A/B testing.
         static const bool fix_q_layout = []{
             const char * env = getenv("PI0_FIX_Q_LAYOUT");
-            if (env && env[0] == '1') { fprintf(stderr, "PI0: q layout fix enabled for flash_attn\n"); return true; }
-            return false;
+            if (env && env[0] == '0') { fprintf(stderr, "PI0: q layout fix DISABLED (flash_attn)\n"); return false; }
+            return true;
         }();
         ggml_tensor * q_for_fa = fix_q_layout
             ? ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3))  // → [head_dim, seq_len, n_head]
@@ -336,19 +383,43 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
         //   attn_v: [head_dim, attn_kv_len,  n_kv_head]
         ggml_tensor * q_std = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
 
-        ggml_tensor * kq = ggml_mul_mat(ctx, attn_k, q_std);          // [n_kv, n_q, n_head]
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-        // NO causal mask — PaliGemma's prefix attention is BIDIRECTIONAL (image/text/state/
-        // action tokens see each other fully). PI0's original code accidentally disabled
-        // causal in flash_attn_ext by passing q with swapped dims (n_q=n_head=8 != n_kv,
-        // so is_causal heuristic returned false). Standard attention must match this.
-        kq = ggml_soft_max_ext(ctx, kq, attn_mask, scale, 0.0f);
-
         // V product. Reduction dim (n_kv) needs to be innermost in src0.
         //   v_t = transpose(attn_v) → [attn_kv_len, head_dim, n_kv_head]
         ggml_tensor * v_t = ggml_cont(ctx, ggml_transpose(ctx, attn_v));
-        ggml_tensor * kqv = ggml_mul_mat(ctx, v_t, kq);               // [head_dim, seq_len, n_head]
+
+        // PI0_ATTN_COLLAPSE=1: MQA shares ONE k/v head, so the broadcast batched
+        // GEMM (r2=n_head) is identical to folding the n_head query heads into the
+        // N dimension and running ONE big GEMM. Same math, but avoids the slow
+        // batched/scalar kernels (native tiled kernel handles the large-N GEMM).
+        // Only valid with no per-head mask (prefix is bidirectional, attn_mask==NULL)
+        // and a single kv head; otherwise fall back to the batched path.
+        static const bool use_collapse = []{
+            const char * env = getenv("PI0_ATTN_COLLAPSE");
+            if (env && env[0] == '1') { fprintf(stderr, "PI0: collapsed attention (MQA fold)\n"); return true; }
+            return false;
+        }();
+
+        ggml_tensor * kqv;
+        if (use_collapse && n_kv_head == 1) {
+            ggml_tensor * q_coll = ggml_reshape_2d(ctx, q_std, head_dim, (int64_t) seq_len * n_head);
+            ggml_tensor * kq = ggml_mul_mat(ctx, attn_k, q_coll);    // [n_kv, n_q*n_head]
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            // Diffusion suffix has a mask [n_kv, seq_len] shared across heads. The collapsed
+            // kq is [n_kv, seq_len*n_head] with column j = (query j%seq_len, head j/seq_len),
+            // so the mask must be tiled n_head times along N. ggml_repeat gives exactly
+            // dest[:,j]=src[:,j%seq_len] — head-independent, numerically exact. (prefix: NULL.)
+            ggml_tensor * mask_coll = attn_mask ? ggml_repeat(ctx, attn_mask, kq) : nullptr;
+            kq = ggml_soft_max_ext(ctx, kq, mask_coll, scale, 0.0f);
+            ggml_tensor * kqv_coll = ggml_mul_mat(ctx, v_t, kq);     // [head_dim, n_q*n_head]
+            kqv = ggml_reshape_3d(ctx, kqv_coll, head_dim, seq_len, n_head);
+        } else {
+            ggml_tensor * kq = ggml_mul_mat(ctx, attn_k, q_std);     // [n_kv, n_q, n_head]
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            // NO causal mask — PaliGemma's prefix attention is BIDIRECTIONAL (image/text/
+            // state/action tokens see each other fully). attn_mask is NULL for the prefix.
+            kq = ggml_soft_max_ext(ctx, kq, attn_mask, scale, 0.0f);
+            kqv = ggml_mul_mat(ctx, v_t, kq);                        // [head_dim, seq_len, n_head]
+        }
 
         attn_out = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
     }
@@ -362,7 +433,9 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
 
     ggml_tensor * gate = ggml_mul_mat(ctx, w.gate_proj, x);
     ggml_tensor * up   = ggml_mul_mat(ctx, w.up_proj,   x);
-    ggml_tensor * ffn  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    // Gemma FFN is GeGLU (gelu), NOT SwiGLU (silu). openpi uses nn.gelu /
+    // HF "gelu_pytorch_tanh"; ggml_gelu is the matching tanh approximation.
+    ggml_tensor * ffn  = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
     ffn = ggml_mul_mat(ctx, w.down_proj, ffn);
 
     input = ggml_add(ctx, input, ffn);
@@ -486,7 +559,11 @@ bool run_paligemma_prefix(pi0_model & m, pi0_session & s, ggml_backend_t backend
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
 
-    ggml_tensor * cur = ggml_scale(ctx, input, sqrtf((float)PALI_N_EMBD));
+    // NOTE: the Gemma sqrt(hidden) embedding scale must be applied to *text*
+    // token embeddings only, NOT to SigLIP image features (PaliGemma convention).
+    // It is therefore applied per-token during prefix assembly by the caller,
+    // not here over the whole (image+text) prefix.
+    ggml_tensor * cur = input;
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16384, false);
 
@@ -523,6 +600,19 @@ bool run_paligemma_prefix(pi0_model & m, pi0_session & s, ggml_backend_t backend
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
         return false;
+    }
+
+    // [debug/compare] dump the PaliGemma final hidden state (after final norm)
+    // to isolate the PaliGemma transformer stage from the expert stage.
+    if (const char * po = getenv("PI0_DUMP_PREFIX_OUT")) {
+        FILE * pf = fopen(po, "wb");
+        if (pf) {
+            std::vector<float> buf((size_t) PALI_N_EMBD * prefix_len);
+            ggml_backend_tensor_get(cur, buf.data(), 0, sizeof(float) * buf.size());
+            fwrite(buf.data(), sizeof(float), buf.size(), pf);
+            fclose(pf);
+            LOG_INF("Dumped prefix_out to %s (%d tok x %d)\n", po, prefix_len, PALI_N_EMBD);
+        }
     }
 
     // KV is now live in s.cache_k/v on the backend — no host roundtrip.
@@ -883,6 +973,14 @@ static constexpr int RT_QK_BLOCK = 32;
 static constexpr int RT_BLOCK_BYTES = 128 + 8 + 16;   // 152
 
 bool pi0_attach_rt_overlay(pi0_model & m, ggml_backend_t backend, const std::string & path) {
+#ifndef GGML_USE_OPENCL
+    // The RT overlay only targets the OpenCL backend (.rt.bin Adreno weights).
+    // Guard the OpenCL symbol references so CPU-only / non-OpenCL builds link.
+    // GGML_USE_OPENCL is propagated PUBLIC from ggml when the backend is built.
+    (void) m; (void) backend; (void) path;
+    LOG_INF("pi0_attach_rt_overlay: built without OpenCL backend; skipping\n");
+    return false;
+#else
     if (!ggml_backend_is_opencl(backend)) {
         LOG_INF("pi0_attach_rt_overlay: backend is not OpenCL; skipping\n");
         return false;
@@ -1002,4 +1100,5 @@ bool pi0_attach_rt_overlay(pi0_model & m, ggml_backend_t backend, const std::str
     LOG_INF("pi0_attach_rt_overlay: attached %d/%u tensors from %s (skipped %d)\n",
             n_attached, n_tens, path.c_str(), n_skipped);
     return n_attached > 0;
+#endif // GGML_USE_OPENCL
 }

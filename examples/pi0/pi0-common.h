@@ -38,6 +38,7 @@ struct gemma_layer_weights {
     ggml_tensor * q_proj    = nullptr;
     ggml_tensor * k_proj    = nullptr;
     ggml_tensor * v_proj    = nullptr;
+    ggml_tensor * qkv_proj  = nullptr; // fused [in, n_head*hd + 2*kv_dim]; if set, used instead of q/k/v
     ggml_tensor * o_proj    = nullptr;
     ggml_tensor * gate_proj = nullptr;
     ggml_tensor * up_proj   = nullptr;
