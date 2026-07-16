@@ -1,5 +1,49 @@
 # PI0 on llama.cpp
 
+## ⚡ Full-Optimization Quickstart (Adreno GPU)
+
+> **To get the optimized numbers you MUST enable all of these — none are on by default.**
+> Missing `PI0_VIT_IMG` alone makes Vision ~2.5× slower (ViT attention falls to a naive
+> `mul_mat_f32_f32` at ~14 GFLOPS instead of the padded Ab_Bi path).
+
+**1. Env flags (all required):**
+
+| Flag | Effect | If missing |
+|------|--------|-----------|
+| `PI0_VIT_IMG=1` | Pads ViT attn head_dim 72→80 → Ab_Bi/`l4_lm` (clip.cpp) | Vision attn on `mul_mat_f32_f32`, **17× slower** |
+| `PI0_VIT_WEIGHT_PRETRANS=1` | Transpose static ViT f16 weights to `[K][M]` **once** (first forward, cached in-place) instead of every frame | `transpose_16_buf` re-transposes weights each forward, **Vision +156 ms** (bit-identical either way) |
+| `PI0_ATTN_IMG=1` | Routes prefix/diffusion QK·AV → `Ab_Bi_8x4_f16` image kernel | Attn AV ~639ms instead of ~21ms |
+| `PI0_ATTN_COLLAPSE=1` | MQA head-fold → 2D GEMM (**required** for `ATTN_IMG`) | un-collapsed batched MQA stays on slow kernel |
+| `PI0_SPLITK=1` | Diffusion FFN down/o_proj split-K (occupancy) | diffusion FFN under-occupied |
+| `PI0_NO_FLASH_ATTN=1` | Keep attn on the routable Ab_Bi kernels | flash bypasses → QK/AV not routed |
+
+**2. Model dir must be the fused package** (`pi0-q4best`): fused-QKV prefix
+(`pi0-gemma-2b-fused.gguf`) + fused-QKV q4 expert. Fusion is auto-detected from the
+`attn_qkv.weight` tensor / the `-fused.gguf` file — no flag.
+
+**3. Device OpenCL env** (Adreno 830, Snapdragon 8 Elite): use the **vendor** ICD.
+
+```bash
+cd /data/local/tmp/pi0/build-android-cl
+env LD_PRELOAD=/system/lib64/libbinder.so \
+    LD_LIBRARY_PATH=.:/vendor/lib64 \
+    OCL_ICD_FILENAMES=/vendor/lib64/libOpenCL_adreno.so \
+    PI0_VIT_IMG=1 PI0_VIT_WEIGHT_PRETRANS=1 PI0_ATTN_IMG=1 PI0_ATTN_COLLAPSE=1 PI0_SPLITK=1 PI0_NO_FLASH_ATTN=1 \
+    ./llama-pi0-bench -m gguf/pi0-q4best \
+      --image data/cam_left_wrist.jpg,data/cam_right_wrist.jpg,data/cam_high.jpg \
+      -p "pick up the red block" \
+      -n 6 --warmup 2 --backend GPUOpenCL --kv-type f16
+```
+
+**Reference (Adreno 830, 3 views, cooled, all flags on):** Vision ~635 ms · Prefix ~1480 ms
+· Diffusion(×10) ~390 ms (Total ~2550 ms). Verify flags took: the per-kernel summary should show
+`Ab_Bi_8x4_f16` for attention, `mul_mat_f32_f32` reduced to a handful of calls, and
+`transpose_16_buf` down to ~9 ms (warmup-only) rather than ~163 ms.
+
+> **Measurement hygiene (mobile GPU):** the Adreno throttles hard under sustained load —
+> a no-cooldown 20-iter run drifts Vision 2005→4126 ms. Insert a cooldown (≥60 s) before
+> each measurement and use a small `-n` (min/median), or numbers are not reproducible.
+
 ## Overview
 
 PI0 is a robotics flow-matching model that predicts continuous robot actions from images and text instructions. It uses iterative denoising (10 steps) instead of autoregressive token generation.

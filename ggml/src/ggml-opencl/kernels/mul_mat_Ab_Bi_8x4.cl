@@ -248,6 +248,97 @@ kernel void kernel_mul_mat_Ab_Bi_8x4_q4k(
     if(idx+3 < m*n_no_padding){ vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx); }
 }
 
+// ---- 1D-flattened q4_0 variant (arbitrary M, e.g. SigLIP ViT hidden=1152) -------------------
+// Identical q4_0 math + memory pattern as kernel_mul_mat_Ab_Bi_8x4, but the (N-tile,M-tile) grid is
+// packed into ONE dimension (like kernel_mul_mat_Ab_Bi_8x4_f16) so M need NOT be a multiple of 512.
+// The 2D kernel launches gws[1]=M/4 with lws[1]=128 (=> M%512); ViT GEMMs with output=hidden=1152
+// fail that. Here gy=N-tile, gx=M-tile from a flat id; store is boundary-guarded for M%4!=0 / N%8!=0.
+// Assumes K%4==0 and K%32==0 (q4_0 packing + scale block); ViT K in {1152,4320} satisfy both.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_128
+#endif
+kernel void kernel_mul_mat_Ab_Bi_8x4_q4_0_flat(
+        global const ushort * src0_q,       // quantized A (4 nibbles/ushort, [K/4][M])
+        global const half  * src0_d,        // A scales [K/32][M]
+        __read_only image1d_buffer_t src1,  // B (1d image)
+        global float * dst,                 // C
+        int m,                              // M
+        int n,                              // N with padding
+        int k,                              // K
+        int n_no_padding                    // N without padding
+) {
+    int n_4 = n >> 2;
+    int m_tiles = (m + 3) >> 2;            // ceil(M/4)
+    int n_tiles = (n_no_padding + 7) >> 3; // ceil(N/8)
+    int flat = get_global_id(0);
+    int gy = flat / m_tiles;
+    if (gy >= n_tiles) { return; }         // tail fibers of the rounded-up launch
+    int gx = flat - gy * m_tiles;
+    int gx_2 = gx << 2;
+
+    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    half8 B;
+    half4 dequantized_weights;
+    __global const ushort* weight_ptr = src0_q + gx_2;
+    __global const half*   scale_ptr  = src0_d + gx_2;
+
+    for(int i=0; i<k; i+=4){
+        ushort4 bits4 = vload4(0, weight_ptr + (i/4)*(m));
+        half4 scale = vload4(0, scale_ptr + (i/32)*(m));
+
+        B.s0123 = read_imageh(src1, gy*2 + (i)*(n_4));   B.s4567 = read_imageh(src1, gy*2 + (i)*(n_4)+1);
+        dequantized_weights.s0 = ((bits4.s0 & 0x000F) - 8) * scale.s0;
+        dequantized_weights.s1 = ((bits4.s1 & 0x000F) - 8) * scale.s1;
+        dequantized_weights.s2 = ((bits4.s2 & 0x000F) - 8) * scale.s2;
+        dequantized_weights.s3 = ((bits4.s3 & 0x000F) - 8) * scale.s3;
+        c0 += B*dequantized_weights.s0; c1 += B*dequantized_weights.s1; c2 += B*dequantized_weights.s2; c3 += B*dequantized_weights.s3;
+
+        B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4)); B.s4567 = read_imageh(src1, gy*2 + (i+1)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & 0x00F0) >> 4) - 8) * scale.s0;
+        dequantized_weights.s1 = (((bits4.s1 & 0x00F0) >> 4) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & 0x00F0) >> 4) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & 0x00F0) >> 4) - 8) * scale.s3;
+        c0 += B*dequantized_weights.s0; c1 += B*dequantized_weights.s1; c2 += B*dequantized_weights.s2; c3 += B*dequantized_weights.s3;
+
+        B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4)); B.s4567 = read_imageh(src1, gy*2 + (i+2)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & 0x0F00) >> 8) - 8) * scale.s0;
+        dequantized_weights.s1 = (((bits4.s1 & 0x0F00) >> 8) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & 0x0F00) >> 8) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & 0x0F00) >> 8) - 8) * scale.s3;
+        c0 += B*dequantized_weights.s0; c1 += B*dequantized_weights.s1; c2 += B*dequantized_weights.s2; c3 += B*dequantized_weights.s3;
+
+        B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4)); B.s4567 = read_imageh(src1, gy*2 + (i+3)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & 0xF000) >> 12) - 8) * scale.s0;
+        dequantized_weights.s1 = (((bits4.s1 & 0xF000) >> 12) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & 0xF000) >> 12) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & 0xF000) >> 12) - 8) * scale.s3;
+        c0 += B*dequantized_weights.s0; c1 += B*dequantized_weights.s1; c2 += B*dequantized_weights.s2; c3 += B*dequantized_weights.s3;
+    }
+
+    int n_row0 = gy << 3;
+    int m_col0 = gx << 2;
+    if (m_col0 + 3 < m && n_row0 + 7 < n_no_padding) {
+        int idx = n_row0*m + m_col0;
+        vstore4((float4)(c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s1, c1.s1, c2.s1, c3.s1), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s2, c1.s2, c2.s2, c3.s2), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s5, c1.s5, c2.s5, c3.s5), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s6, c1.s6, c2.s6, c3.s6), 0, dst + idx); idx += m;
+        vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
+    } else {
+        if (n_row0+0 < n_no_padding){ int b=(n_row0+0)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s0; if(m_col0+1<m)dst[b+1]=c1.s0; if(m_col0+2<m)dst[b+2]=c2.s0; if(m_col0+3<m)dst[b+3]=c3.s0; }
+        if (n_row0+1 < n_no_padding){ int b=(n_row0+1)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s1; if(m_col0+1<m)dst[b+1]=c1.s1; if(m_col0+2<m)dst[b+2]=c2.s1; if(m_col0+3<m)dst[b+3]=c3.s1; }
+        if (n_row0+2 < n_no_padding){ int b=(n_row0+2)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s2; if(m_col0+1<m)dst[b+1]=c1.s2; if(m_col0+2<m)dst[b+2]=c2.s2; if(m_col0+3<m)dst[b+3]=c3.s2; }
+        if (n_row0+3 < n_no_padding){ int b=(n_row0+3)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s3; if(m_col0+1<m)dst[b+1]=c1.s3; if(m_col0+2<m)dst[b+2]=c2.s3; if(m_col0+3<m)dst[b+3]=c3.s3; }
+        if (n_row0+4 < n_no_padding){ int b=(n_row0+4)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s4; if(m_col0+1<m)dst[b+1]=c1.s4; if(m_col0+2<m)dst[b+2]=c2.s4; if(m_col0+3<m)dst[b+3]=c3.s4; }
+        if (n_row0+5 < n_no_padding){ int b=(n_row0+5)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s5; if(m_col0+1<m)dst[b+1]=c1.s5; if(m_col0+2<m)dst[b+2]=c2.s5; if(m_col0+3<m)dst[b+3]=c3.s5; }
+        if (n_row0+6 < n_no_padding){ int b=(n_row0+6)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s6; if(m_col0+1<m)dst[b+1]=c1.s6; if(m_col0+2<m)dst[b+2]=c2.s6; if(m_col0+3<m)dst[b+3]=c3.s6; }
+        if (n_row0+7 < n_no_padding){ int b=(n_row0+7)*m+m_col0; if(m_col0+0<m)dst[b]=c0.s7; if(m_col0+1<m)dst[b+1]=c1.s7; if(m_col0+2<m)dst[b+2]=c2.s7; if(m_col0+3<m)dst[b+3]=c3.s7; }
+    }
+}
+
 // ---- f16-weight variant of kernel_mul_mat_Ab_Bi_8x4 ----------------------------------------
 // Same access pattern (B/activations via image1d_buffer -> TP L1; weights via global/L2 with high
 // cross-workgroup reuse; 8x4 micro-tile; half8 accum) but src0 (the "weights") is plain f16, not

@@ -726,15 +726,20 @@ struct ggml_backend_opencl_context {
             info.cmd_total_duration_ns      = cmd_complete  - cmd_queued;
         }
 
-        // Dump a csv
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        // Dump a csv. Extra columns (k, flops, queued/start/end ns) let a post-processor
+        // recover per-kernel call counts, verify the GFLOPS numerator, and reconstruct the
+        // device timeline (host_time = wall-clock advance incl. inter-kernel gaps).
+        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size, k, flops, queued_ns, start_ns, end_ns\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%lld,%llu,%llu,%llu,%llu\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
-                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
+                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3],
+                (long long) info.src0_ne[0], (unsigned long long) estimate_op_flops(info),
+                (unsigned long long) info.cmd_queued, (unsigned long long) info.cmd_start,
+                (unsigned long long) info.cmd_end);
         }
         fclose(fperf);
 
@@ -838,6 +843,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_transpose_16;
     cl_kernel kernel_transpose_8_buf;
     cl_kernel kernel_transpose_16_buf;
+    cl_kernel kernel_transpose_16_buf_tiled;
     cl_kernel kernel_transpose_32_buf;
     cl_kernel kernel_transpose_16_4x1;
 
@@ -865,6 +871,7 @@ struct ggml_backend_opencl_context {
     cl_kernel CL_mul_mat_Ab_Bi_32x4;       // PI0 diag E5: 32-N tile (4x weight reuse)
     cl_kernel CL_mul_mat_Ab_Bi_8x4_aimg;   // PI0 diag E6a: weights via texture (image1d_buffer)
     cl_kernel CL_mul_mat_Ab_Bi_8x4_q4k;    // PI0 q4_K operating point: 8x4 image-B, uint8 sub-scale+min + fp16 super
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_q4_0_flat; // PI0 ViT: 1D-flatten q4_0 (arbitrary M, e.g. hidden=1152)
     cl_kernel CL_mul_mat_Ab_Bi_8x4_noguard;// PI0 diag E6b: store guards removed
     cl_kernel CL_mul_mat_Ab_Bi_8x4_unroll; // PI0 diag E6c: K-loop unroll 2
     cl_kernel CL_mul_mat_Ab_Bi_8x4_Bonly_image_i8; // PI0 diag: B-only stream as int8 (read-BW test)
@@ -2695,6 +2702,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_transpose_16    = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_8_buf  = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_8_buf", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_16_buf = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_buf", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_16_buf_tiled = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_buf_tiled", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_32_buf = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_buf", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_16_4x1 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16_4x1", &err), err));
         GGML_LOG_CONT(".");
@@ -2828,6 +2836,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_32x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_32x4", &err), err));
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_aimg = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_aimg", &err), err));
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4k = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_q4k", &err), err));
+        CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4_0_flat = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_q4_0_flat", &err), err));
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_noguard = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_noguard", &err), err));
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_unroll = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_unroll", &err), err));
         CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_i8 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mat_Ab_Bi_8x4_Bonly_image_i8", &err), err));
@@ -3525,10 +3534,16 @@ struct ggml_tensor_extra_cl {
     // block to the pool.
     size_t actual_size;
 
+    // PI0 (PI0_VIT_WEIGHT_PRETRANS): set once the static f16 ViT proj/FFN weight backing this
+    // extra has been transposed IN-PLACE to the Ab_Bi [K][M] layout, so subsequent forwards skip
+    // the per-call transpose. Only ever set for genuine weights (op==NONE); default false.
+    bool pi0_wt_transposed = false;
+
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        pi0_wt_transposed = false;
     }
 };
 
@@ -10625,7 +10640,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         } else if (pi0_gemm_variant_is("bonly_q8")) {
             kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_Bonly_image_q8; // 8 int8/64-bit fetch
         } else {
-            kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4;
+            // PI0 ViT: a q4_0 GEMM whose output M is not a multiple of 512 (e.g. SigLIP hidden=1152)
+            // cannot use the 2D launch (gws[1]=M/4 with lws[1]=128 => M%512); fall back to the
+            // 1D-flattened kernel (same 8 args, arbitrary M). N==1 (mat-vec) keeps its own path.
+            kernel = (ne1 != 1 && ne01 % 512 != 0)
+                   ? backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4_0_flat
+                   : backend_ctx->CL_mul_mat_Ab_Bi_8x4;
         }
         // <--------------------------------------------> //
 
@@ -10735,6 +10755,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             global_work_size[0] = (((M / 2) + wavesize - 1) / wavesize) * wavesize;
             global_work_size[1] = 4; // reduce factor
             global_work_size[2] = 1;
+        }
+
+        // PI0 ViT: 1D-flattened launch for the arbitrary-M q4_0 kernel (M%512 fallback, e.g. hidden=1152).
+        if (kernel == backend_ctx->CL_mul_mat_Ab_Bi_8x4_q4_0_flat) {
+            size_t m_tiles = (size_t)((M + 3) / 4);
+            size_t n_tiles = (size_t)((N + 7) / 8);
+            global_work_size[0] = ((m_tiles * n_tiles + 127) / 128) * 128;
+            global_work_size[1] = 1;
+            global_work_size[2] = 1;
+            local_work_size[0]  = 128;
+            local_work_size[1]  = 1;
+            local_work_size[2]  = 1;
         }
         // <--------------------------------------------> //
 

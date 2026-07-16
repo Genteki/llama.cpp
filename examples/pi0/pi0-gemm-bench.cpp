@@ -191,6 +191,42 @@ int main(int argc, char ** argv) {
     upload_b(f16_case.b);
     upload_b(f16_abbi.b);
 
+    // Profiler hook: PI0_GEMM_SOLO=<variant> runs ONLY that variant in a tight loop
+    // (iters times) then exits, giving an external HW-counter profiler (Snapdragon
+    // Profiler) a single, sustained kernel stream to multiplex counters over.
+    // Use a large -n so the run lasts several seconds. All weight layouts are already
+    // uploaded above; pick the case matching the variant's layout.
+    if (const char * solo = getenv("PI0_GEMM_SOLO")) {
+        const std::string v = solo;
+        printf("SOLO: variant='%s'  x%d (warmup %d)  -- attach profiler now\n",
+               solo, iters, warmup);
+        fflush(stdout);
+        double ms = 0.0;
+        if (v == "q4k") {
+            // native q4_K (uint8 sub-scale kernel): own case; needs M%512 & K%256.
+            if (!(M % 512 == 0 && K % 256 == 0)) {
+                fprintf(stderr, "SOLO q4k needs M%%512==0 and K%%256==0\n"); return 1;
+            }
+            std::vector<uint8_t> q4k(ggml_row_size(GGML_TYPE_Q4_K, K) * M);
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, srcA.data(), q4k.data(), 0, M, K, nullptr);
+            setenv("PI0_GEMM_VARIANT", "q4k", 1);   // host q4_K decode -> SoA interleaved layout
+            gemm_case c = build_case(backend, GGML_TYPE_Q4_K, M, N, K);
+            ggml_backend_tensor_set(c.a, q4k.data(), 0, q4k.size());
+            upload_b(c.b);
+            ms = time_case(backend, c, "q4k", iters, warmup, nullptr);
+            ggml_gallocr_free(c.alloc); ggml_free(c.ctx);
+        } else {
+            gemm_case * cse = &q4_adreno;        // abbi / abbi_gb / bonly_* / aonly / lowcompute
+            const char * var = solo;
+            if      (v == "l4lm")     cse = &q4_std;
+            else if (v == "abbi_f16") cse = &f16_abbi;
+            else if (v == "f16")    { cse = &f16_case; var = nullptr; }
+            ms = time_case(backend, *cse, var, iters, warmup, nullptr);
+        }
+        printf("SOLO: %s  %.3f ms/call (min)\n", solo, ms);
+        return 0;
+    }
+
     // Time each config (min over iters). Capture C for the correctness pass.
     // The q4_0 Ab_Bi grid needs M a multiple of 512 (gws[1]=M/4 % 128 == 0); skip it otherwise
     // (e.g. M=256 for AV) so the f16 variants can still be benchmarked.

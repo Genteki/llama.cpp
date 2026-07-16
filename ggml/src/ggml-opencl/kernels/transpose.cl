@@ -70,6 +70,32 @@ kernel void kernel_transpose_16_buf(
     output[x*ldo + y] = input[y*ldi + x];
 }
 
+// Coalesced LDS-tiled variant of kernel_transpose_16_buf (bit-identical output).
+// The naive kernel above writes output[x*ldo + y] with a stride of ldo -> uncoalesced writes
+// (~5% of memory bandwidth). This stages a 16x16 tile through local memory so both the read and
+// the write are coalesced. Dispatch with local={16,16} and global padded up to a multiple of 16.
+kernel void kernel_transpose_16_buf_tiled(
+    global const ushort * input,   // [ldo][ldi] : in[y*ldi + x]
+    global ushort * output,        // [ldi][ldo] : out[x*ldo + y]
+    const int ldi,
+    const int ldo
+) {
+    __local ushort tile[16][17];   // +1 column removes shared-memory bank conflicts
+    const int bx = get_group_id(0) * 16;   // tile origin over ldi (x)
+    const int by = get_group_id(1) * 16;   // tile origin over ldo (y)
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+
+    const int ix = bx + lx;
+    const int iy = by + ly;
+    if (ix < ldi && iy < ldo) tile[ly][lx] = input[iy*ldi + ix];   // coalesced read  (lx -> ix)
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int ox = by + lx;
+    const int oy = bx + ly;
+    if (oy < ldi && ox < ldo) output[oy*ldo + ox] = tile[lx][ly];  // coalesced write (lx -> ox)
+}
+
 // Transpose treating each element as 32-bit using buffer
 kernel void kernel_transpose_32_buf(
     global const uint * input,

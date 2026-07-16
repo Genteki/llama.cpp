@@ -54,7 +54,7 @@ def load_tensor(model_dir: Path, tensor_name: str) -> np.ndarray:
 
 # Tensors that are used in ggml_mul_mat and can be stored as f16
 MUL_MAT_NAMES = {
-    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out.weight",
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_qkv.weight", "attn_out.weight",
     "ffn_up.weight", "ffn_down.weight", "mm.0.weight",
     # Gemma LLM names
     "attn_output.weight", "ffn_gate.weight",
@@ -75,6 +75,24 @@ def add_tensor(writer, name: str, data: np.ndarray, use_f16: bool):
         data = data.astype(np.float32)
     writer.add_tensor(name, data)
     print(f"  {name}: {list(data.shape)} ({data.dtype})")
+
+
+# ViT (SigLIP) FFN K%32 pad: 4304 -> 4320 (nearest multiple of 32) so q4_0/q8_0 blocks tile cleanly.
+# The intermediate is internal (gelu(0)=0), so zero-padding fc1 rows + fc2 cols is math-preserving.
+VIT_N_FF_PAD = ((4304 + 31) // 32) * 32  # 4320
+
+
+def add_vit_weight(writer, name: str, data: np.ndarray, vit_quant: str, use_f16: bool):
+    """Quantized ViT GEMM weight (Adreno fast path) when vit_quant set; else f16/f32 like add_tensor.
+    `data` is expected already padded so its in-dim (last axis) is a multiple of 32."""
+    if vit_quant in ("q4_0", "q8_0"):
+        from gguf import GGMLQuantizationType as _Q, quants as _quants
+        qt = {"q4_0": _Q.Q4_0, "q8_0": _Q.Q8_0}[vit_quant]
+        q = _quants.quantize(data.astype(np.float32), qt)
+        writer.add_tensor(name, q, raw_dtype=qt)
+        print(f"  {name}: {list(data.shape)} -> {vit_quant} ({q.nbytes} B)")
+    else:
+        add_tensor(writer, name, data, use_f16)
 
 
 def add_tokenizer(writer, tokenizer_path: Path):
@@ -121,8 +139,10 @@ def add_tokenizer(writer, tokenizer_path: Path):
     print(f"  Vocab size: {vocab_size}, BOS: {sp.bos_id()}, EOS: {sp.eos_id()}")
 
 
-def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool):
-    """Convert SigLIP So400m vision encoder + linear projector."""
+def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool, vit_quant: str = "none",
+                   vit_f16_layers: set = None, vit_fuse_qkv: bool = False):
+    """Convert SigLIP So400m vision encoder + linear projector.
+    vit_f16_layers: layer indices whose FFN stays f16 even when vit_quant is set (accuracy-sensitive)."""
     print("\n=== Converting mmproj (SigLIP + projector) ===")
 
     writer = gguf.GGUFWriter(str(output_path), arch="clip")
@@ -134,6 +154,7 @@ def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool):
     n_head = 16
     n_layer = 27
     n_ff = 4304
+    n_ff_store = VIT_N_FF_PAD if vit_quant in ("q4_0", "q8_0") else n_ff  # pad intermediate for K%32
     image_size = 224
     patch_size = 14
 
@@ -142,7 +163,7 @@ def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool):
     writer.add_vision_image_size(image_size)
     writer.add_vision_patch_size(patch_size)
     writer.add_vision_embedding_length(n_embd)
-    writer.add_vision_feed_forward_length(n_ff)
+    writer.add_vision_feed_forward_length(n_ff_store)
     writer.add_vision_block_count(n_layer)
     writer.add_vision_head_count(n_head)
     writer.add_vision_attention_layernorm_eps(1e-6)
@@ -180,21 +201,27 @@ def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool):
         data = load_tensor(model_dir, f"{prefix}.layer_norm1.bias")
         add_tensor(writer, f"{blk}.ln1.bias", data, use_f16)
 
-        # Attention Q, K, V (separate in PI0's SigLIP)
-        data = load_tensor(model_dir, f"{prefix}.self_attn.q_proj.weight")
-        add_tensor(writer, f"{blk}.attn_q.weight", data, use_f16)
-        data = load_tensor(model_dir, f"{prefix}.self_attn.q_proj.bias")
-        add_tensor(writer, f"{blk}.attn_q.bias", data, use_f16)
-
-        data = load_tensor(model_dir, f"{prefix}.self_attn.k_proj.weight")
-        add_tensor(writer, f"{blk}.attn_k.weight", data, use_f16)
-        data = load_tensor(model_dir, f"{prefix}.self_attn.k_proj.bias")
-        add_tensor(writer, f"{blk}.attn_k.bias", data, use_f16)
-
-        data = load_tensor(model_dir, f"{prefix}.self_attn.v_proj.weight")
-        add_tensor(writer, f"{blk}.attn_v.weight", data, use_f16)
-        data = load_tensor(model_dir, f"{prefix}.self_attn.v_proj.bias")
-        add_tensor(writer, f"{blk}.attn_v.bias", data, use_f16)
+        # Attention Q, K, V (separate in PI0's SigLIP).
+        # --vit-fuse-qkv: concat [q;k;v] along the output axis into one attn_qkv tensor so
+        # clip.cpp's build_vit fused path (layer.qkv_w != nullptr) runs a single GEMM and
+        # view-splits it (view order Q@0 / K@n_embd / V@2*n_embd -> must be [q,k,v]).
+        # Bit-identical math; only affects kernel dispatch. Default off => output unchanged.
+        qw = load_tensor(model_dir, f"{prefix}.self_attn.q_proj.weight")
+        kw = load_tensor(model_dir, f"{prefix}.self_attn.k_proj.weight")
+        vw = load_tensor(model_dir, f"{prefix}.self_attn.v_proj.weight")
+        qb = load_tensor(model_dir, f"{prefix}.self_attn.q_proj.bias")
+        kb = load_tensor(model_dir, f"{prefix}.self_attn.k_proj.bias")
+        vb = load_tensor(model_dir, f"{prefix}.self_attn.v_proj.bias")
+        if vit_fuse_qkv:
+            add_tensor(writer, f"{blk}.attn_qkv.weight", np.concatenate([qw, kw, vw], axis=0), use_f16)
+            add_tensor(writer, f"{blk}.attn_qkv.bias",   np.concatenate([qb, kb, vb], axis=0), use_f16)
+        else:
+            add_tensor(writer, f"{blk}.attn_q.weight", qw, use_f16)
+            add_tensor(writer, f"{blk}.attn_q.bias",   qb, use_f16)
+            add_tensor(writer, f"{blk}.attn_k.weight", kw, use_f16)
+            add_tensor(writer, f"{blk}.attn_k.bias",   kb, use_f16)
+            add_tensor(writer, f"{blk}.attn_v.weight", vw, use_f16)
+            add_tensor(writer, f"{blk}.attn_v.bias",   vb, use_f16)
 
         # Attention output
         data = load_tensor(model_dir, f"{prefix}.self_attn.out_proj.weight")
@@ -208,15 +235,23 @@ def convert_mmproj(model_dir: Path, output_path: Path, use_f16: bool):
         data = load_tensor(model_dir, f"{prefix}.layer_norm2.bias")
         add_tensor(writer, f"{blk}.ln2.bias", data, use_f16)
 
-        # MLP
-        data = load_tensor(model_dir, f"{prefix}.mlp.fc1.weight")
-        add_tensor(writer, f"{blk}.ffn_up.weight", data, use_f16)
-        data = load_tensor(model_dir, f"{prefix}.mlp.fc1.bias")
+        # MLP  (quantize fc1/fc2 for the Adreno fast path when vit_quant set; pad intermediate to n_ff_store).
+        # Per-layer selectivity: layers in vit_f16_layers stay f16 (still zero-padded so n_ff is uniform).
+        lq = "none" if (vit_f16_layers and il in vit_f16_layers) else vit_quant
+        data = load_tensor(model_dir, f"{prefix}.mlp.fc1.weight")   # [n_ff, n_embd]
+        if n_ff_store != n_ff:
+            data = np.pad(data, ((0, n_ff_store - n_ff), (0, 0)))
+        add_vit_weight(writer, f"{blk}.ffn_up.weight", data, lq, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.mlp.fc1.bias")     # [n_ff]
+        if n_ff_store != n_ff:
+            data = np.pad(data, (0, n_ff_store - n_ff))
         add_tensor(writer, f"{blk}.ffn_up.bias", data, use_f16)
 
-        data = load_tensor(model_dir, f"{prefix}.mlp.fc2.weight")
-        add_tensor(writer, f"{blk}.ffn_down.weight", data, use_f16)
-        data = load_tensor(model_dir, f"{prefix}.mlp.fc2.bias")
+        data = load_tensor(model_dir, f"{prefix}.mlp.fc2.weight")   # [n_embd, n_ff]
+        if n_ff_store != n_ff:
+            data = np.pad(data, ((0, 0), (0, n_ff_store - n_ff)))
+        add_vit_weight(writer, f"{blk}.ffn_down.weight", data, lq, use_f16)
+        data = load_tensor(model_dir, f"{prefix}.mlp.fc2.bias")     # [n_embd]
         add_tensor(writer, f"{blk}.ffn_down.bias", data, use_f16)
 
     # Projector: simple Linear(1152 -> 2048)
@@ -509,6 +544,12 @@ def main():
                         help="Convert a pi0.5 checkpoint (adaRMS action expert, e.g. lerobot/pi05_base). "
                              "Vision + PaliGemma are identical to pi0; only the expert branch differs. "
                              "Outputs pi05-*.gguf.")
+    parser.add_argument("--vit-quant", type=str, default="none", choices=["none", "q4_0", "q8_0"],
+                        help="Quantize SigLIP ViT FFN weights (fc1/fc2) for the Adreno fast path. "
+                             "Pads the intermediate 4304->4320 (K%%32); math-preserving (gelu(0)=0).")
+    parser.add_argument("--vit-fuse-qkv", action="store_true",
+                        help="Fuse SigLIP q/k/v proj into one attn_qkv tensor (clip.cpp build_vit "
+                             "runs it as a single GEMM). Bit-identical; outputs a -fuseqkv mmproj gguf.")
     args = parser.parse_args()
 
     model_dir = Path(args.model)
@@ -519,7 +560,11 @@ def main():
     use_f16 = args.type == "f16"
     pfx = "pi05" if args.pi05 else "pi0"
 
-    convert_mmproj(model_dir, output_dir / f"{pfx}-mmproj.gguf", use_f16)
+    mmproj_tag = "" if args.vit_quant == "none" else f"-vit{args.vit_quant}"
+    if args.vit_fuse_qkv:
+        mmproj_tag += "-fuseqkv"
+    convert_mmproj(model_dir, output_dir / f"{pfx}-mmproj{mmproj_tag}.gguf", use_f16, args.vit_quant,
+                   vit_fuse_qkv=args.vit_fuse_qkv)
     convert_gemma_2b(model_dir, output_dir / f"{pfx}-gemma-2b.gguf", use_f16, tokenizer_path)
     if args.pi05:
         convert_action_expert_pi05(model_dir, output_dir / f"{pfx}-action-expert.gguf", use_f16)

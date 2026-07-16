@@ -107,15 +107,47 @@ static void ggml_cl_mul_mat_pi0_attn_img(ggml_backend_t backend, const ggml_tens
     // serializes transpose→GEMM→next-transpose, so one buffer is safe to reuse (same as prealloc_act_trans).
     backend_ctx->prealloc_pi0_at.allocate(context, region.size + 64);
     cl_mem A_T = backend_ctx->prealloc_pi0_at.buffer;
-    {
-        cl_kernel tk = backend_ctx->kernel_transpose_16_buf;
+
+    // PI0_VIT_WEIGHT_PRETRANS=1: a ViT proj/FFN weight is a STATIC f16 leaf, so its [K][M] transpose
+    // is loop-invariant. Do it ONCE and cache it IN-PLACE inside the weight's own device buffer (the
+    // q4_0 path already does exactly this for its quant/scale buffers), instead of re-transposing every
+    // forward. Only genuine weights qualify (op==NONE + ViT-shaped); attention KV is a dynamic
+    // activation and never matches, so it keeps the per-call transpose. Writing the result back into
+    // src0_sub adds no persistent allocation -> avoids the ~800MB/+27s stall that sank the earlier
+    // cross-pass A_T cache. Default off -> path below is byte-for-byte unchanged. (Recommended ON as
+    // part of the optimal flag set; bit-identical, measured Vision -19.7% -- see examples/pi0/README.)
+    static const bool wt_pretrans = [] { const char * e = getenv("PI0_VIT_WEIGHT_PRETRANS"); return e && e[0] == '1'; }();
+    const bool is_vit_weight = wt_pretrans && src0->op == GGML_OP_NONE && pi0_vit_img_eligible(src0, src1, dst);
+    cl_mem A_gemm = A_T;   // default: GEMM reads A from the freshly transposed scratch
+
+    if (is_vit_weight && extra0->pi0_wt_transposed) {
+        // Transposed on a previous forward -> src0_sub already holds [K][M]; skip the transpose.
+        A_gemm = src0_sub;
+    } else {
+        // PI0_FAST_TRANSPOSE=1 -> coalesced LDS-tiled transpose (bit-identical, ~5-6x less time).
+        static const bool fast_trans = [] { const char * e = getenv("PI0_FAST_TRANSPOSE"); return e && e[0] == '1'; }();
         int ldi = K, ldo = M;
+        cl_kernel tk = fast_trans ? backend_ctx->kernel_transpose_16_buf_tiled
+                                  : backend_ctx->kernel_transpose_16_buf;
         CL_CHECK(clSetKernelArg(tk, 0, sizeof(cl_mem), &src0_sub));
         CL_CHECK(clSetKernelArg(tk, 1, sizeof(cl_mem), &A_T));
         CL_CHECK(clSetKernelArg(tk, 2, sizeof(int),    &ldi));
         CL_CHECK(clSetKernelArg(tk, 3, sizeof(int),    &ldo));
-        size_t tg[3] = { (size_t) K, (size_t) M, 1 };
-        backend_ctx->enqueue_ndrange_kernel(tk, 2, tg, NULL, dst);
+        if (fast_trans) {
+            size_t tl[3] = { 16, 16, 1 };
+            size_t tg[3] = { (size_t)((K + 15) & ~15), (size_t)((M + 15) & ~15), 1 };
+            backend_ctx->enqueue_ndrange_kernel(tk, 2, tg, tl, dst);
+        } else {
+            size_t tg[3] = { (size_t) K, (size_t) M, 1 };
+            backend_ctx->enqueue_ndrange_kernel(tk, 2, tg, NULL, dst);
+        }
+        if (is_vit_weight) {
+            // Persist the transpose: copy A_T back into the weight's own buffer (once, first forward).
+            CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, A_T, src0_sub, 0, 0,
+                (size_t) K * M * sizeof(ggml_fp16_t), 0, NULL, NULL));
+            extra0->pi0_wt_transposed = true;
+            A_gemm = src0_sub;
+        }
     }
 
     // --- src1 (f32 Q/scores) -> B image (f16 Bi, N zero-padded), via kernel_transpose_32_16 ---
@@ -203,7 +235,7 @@ static void ggml_cl_mul_mat_pi0_attn_img(ggml_backend_t backend, const ggml_tens
         cl_mem partials = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t) k_split * plane * sizeof(float), NULL, &status);
         CL_CHECK(status);
         cl_kernel sk = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f16_splitk;
-        CL_CHECK(clSetKernelArg(sk, 0, sizeof(cl_mem), &A_T));
+        CL_CHECK(clSetKernelArg(sk, 0, sizeof(cl_mem), &A_gemm));
         CL_CHECK(clSetKernelArg(sk, 1, sizeof(cl_mem), &B_image1d));
         CL_CHECK(clSetKernelArg(sk, 2, sizeof(cl_mem), &partials));
         CL_CHECK(clSetKernelArg(sk, 3, sizeof(int),    &M));
@@ -226,7 +258,7 @@ static void ggml_cl_mul_mat_pi0_attn_img(ggml_backend_t backend, const ggml_tens
         CL_CHECK(clReleaseMemObject(partials));
     } else {
         cl_kernel fk = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f16;
-        CL_CHECK(clSetKernelArg(fk, 0, sizeof(cl_mem), &A_T));
+        CL_CHECK(clSetKernelArg(fk, 0, sizeof(cl_mem), &A_gemm));
         CL_CHECK(clSetKernelArg(fk, 1, sizeof(cl_mem), &B_image1d));
         CL_CHECK(clSetKernelArg(fk, 2, sizeof(cl_mem), &C_d));
         CL_CHECK(clSetKernelArg(fk, 3, sizeof(int),    &M));
