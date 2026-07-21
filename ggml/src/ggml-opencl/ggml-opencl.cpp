@@ -330,13 +330,19 @@ struct ProfilingInfo {
     int     op_type;        // ggml_op enum value, or -1 if unknown
     int64_t src0_ne[4];     // input 0 dims (zeros if no src0)
     int64_t src1_ne[4];     // input 1 dims (zeros if no src1)
+    std::string phase;      // PI0 pipeline phase tag (vision/prefix/diffusion), set via ggml_opencl_set_profile_phase
 };
+
+// PI0: current pipeline-phase label stamped onto each profiled kernel.
+static std::string g_profile_phase;
+extern "C" void ggml_opencl_set_profile_phase(const char * name) { g_profile_phase = name ? name : ""; }
 
 static void populateProfilingInfo(
         ProfilingInfo& info, cl_event evt, cl_kernel kernel, cl_uint work_dim,
         size_t global_size[3], size_t local_size[3],
         const ggml_tensor * tensor) {
     info.op_name     = tensor->name;
+    info.phase       = g_profile_phase;
     info.kernel      = kernel;
     info.evt         = evt;
 
@@ -729,10 +735,10 @@ struct ggml_backend_opencl_context {
         // Dump a csv. Extra columns (k, flops, queued/start/end ns) let a post-processor
         // recover per-kernel call counts, verify the GFLOPS numerator, and reconstruct the
         // device timeline (host_time = wall-clock advance incl. inter-kernel gaps).
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size, k, flops, queued_ns, start_ns, end_ns\n");
+        fprintf(fperf, "op name, kernel name, phase, exec duration (ms), global size, local size, output size, k, flops, queued_ns, start_ns, end_ns\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%lld,%llu,%llu,%llu,%llu\n",
-                info.op_name.c_str(), info.kernel_name.c_str(),
+            fprintf(fperf, "%s,%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%lld,%llu,%llu,%llu,%llu\n",
+                info.op_name.c_str(), info.kernel_name.c_str(), info.phase.c_str(),
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
@@ -774,7 +780,8 @@ struct ggml_backend_opencl_context {
         cl_ulong grand_total_ns    = 0;
         uint64_t grand_total_flops = 0;
         for (const ProfilingInfo & info : profiling_info) {
-            Agg & a = agg[info.kernel_name];
+            std::string key = (info.phase.empty() ? std::string("?") : info.phase) + " | " + info.kernel_name;
+            Agg & a = agg[key];
             uint64_t flops = estimate_op_flops(info);
             a.total_ns    += info.cmd_duration_ns;
             a.calls       += 1;

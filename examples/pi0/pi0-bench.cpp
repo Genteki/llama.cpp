@@ -12,6 +12,12 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "ggml.h"
+
+// PI0: tag profiled OpenCL kernels by pipeline phase (no-op if OpenCL not linked).
+extern "C" void ggml_opencl_set_profile_phase(const char *) __attribute__((weak));
+static inline void pi0_profile_phase(const char * p) {
+    if (ggml_opencl_set_profile_phase) ggml_opencl_set_profile_phase(p);
+}
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -292,6 +298,7 @@ int main(int argc, char ** argv) {
         int64_t t_iter_start = ggml_time_us();
 
         // ---- Phase: Vision Encode ----
+        pi0_profile_phase("vision");
         int64_t t0 = ggml_time_us();
 
         std::vector<float> prefix_embeddings;
@@ -329,6 +336,7 @@ int main(int argc, char ** argv) {
         int64_t t1 = ggml_time_us();
 
         // ---- Phase: Prefix Pass ----
+        pi0_profile_phase("prefix");
         if (!run_paligemma_prefix(model, session, backend, prefix_embeddings.data(), actual_prefix_len)) {
             LOG_ERR("Prefix pass failed at run %d\n", run);
             return 1;
@@ -336,6 +344,7 @@ int main(int argc, char ** argv) {
         int64_t t2 = ggml_time_us();
 
         // ---- Phase: Diffusion Loop ----
+        pi0_profile_phase("diffusion");
         std::mt19937 rng(42);
         std::normal_distribution<float> normal(0.0f, 1.0f);
 
