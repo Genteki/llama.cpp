@@ -435,7 +435,9 @@ static ggml_tensor * build_gemma_layer(ggml_context * ctx,
     ggml_tensor * up   = ggml_mul_mat(ctx, w.up_proj,   x);
     // Gemma FFN is GeGLU (gelu), NOT SwiGLU (silu). openpi uses nn.gelu /
     // HF "gelu_pytorch_tanh"; ggml_gelu is the matching tanh approximation.
-    ggml_tensor * ffn  = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+    // GeGLU fused: gelu(gate)*up in ONE op (HTP glu_geglu tanh kernel) instead of
+    // separate GELU + MUL (two HVX passes over the 16384-wide hidden). Same tanh gelu.
+    ggml_tensor * ffn  = ggml_geglu_split(ctx, gate, up);
     ffn = ggml_mul_mat(ctx, w.down_proj, ffn);
 
     input = ggml_add(ctx, input, ffn);

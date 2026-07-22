@@ -68,6 +68,10 @@ static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
 static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
+// PI0: per-op HTP profiling CSV + pipeline-phase tag (parallels the OpenCL profiler).
+static std::string g_htp_profile_phase;
+static FILE *      g_htp_prof_csv = nullptr;
+extern "C" void ggml_hexagon_set_profile_phase(const char * name) { g_htp_profile_phase = name ? name : ""; }
 static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
@@ -166,6 +170,11 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
     GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|%s|%s|%s|%s|%s|usec %u cycles %u start %u mhz %.1f%s\n", sess_name.c_str(),
             node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
+    if (!g_htp_prof_csv) { g_htp_prof_csv = fopen("htp_profiling.csv", "w");
+        if (g_htp_prof_csv) fprintf(g_htp_prof_csv, "phase\top\tnames\tdims\ttypes\tusec\tcycles\n"); }
+    if (g_htp_prof_csv) { fprintf(g_htp_prof_csv, "%s\t%s\t%s\t%s\t%s\t%u\t%u\n",
+        g_htp_profile_phase.c_str(), node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, op_usec, op_cycles);
+        fflush(g_htp_prof_csv); }
 }
 
 // **

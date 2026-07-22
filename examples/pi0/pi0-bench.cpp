@@ -15,8 +15,10 @@
 
 // PI0: tag profiled OpenCL kernels by pipeline phase (no-op if OpenCL not linked).
 extern "C" void ggml_opencl_set_profile_phase(const char *) __attribute__((weak));
+extern "C" void ggml_hexagon_set_profile_phase(const char *) __attribute__((weak));
 static inline void pi0_profile_phase(const char * p) {
-    if (ggml_opencl_set_profile_phase) ggml_opencl_set_profile_phase(p);
+    if (ggml_opencl_set_profile_phase)  ggml_opencl_set_profile_phase(p);
+    if (ggml_hexagon_set_profile_phase) ggml_hexagon_set_profile_phase(p);
 }
 #include "ggml-cpu.h"
 
