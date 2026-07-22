@@ -290,3 +290,66 @@ Bench
     -n 1 --warmup 1 -ngl 0 \
     --backend cpu --kv-type f16
 ```
+## Hexagon (NPU) Backend
+
+PI0's **prefix** (PaliGemma-2B) and **flow-matching diffusion** (action expert) both run
+on the Qualcomm **Hexagon NPU** via the in-tree `ggml-hexagon` backend (HMX matrix unit
+over FastRPC). The **vision** encoder (SigLIP) stays on the GPU — HTP has no CONV, so it
+falls back automatically. On an SM8750 (Snapdragon 8 Elite / Hexagon v79) the NPU runs
+the prefix **~3.3× faster** than the tuned Adreno OpenCL path.
+
+### Requirements
+- Snapdragon device with a Hexagon NPU (tested: 8 Elite / **v79**; skels also build for
+  v73 / v75 / v81).
+- Hexagon SDK + NDK. Easiest via the official toolchain container
+  `ghcr.io/snapdragon-toolchain/arm64-android:v0.3` (NDK r28b + Hexagon SDK 6.4.0.2).
+
+### Build
+```bash
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:/workspace" ghcr.io/snapdragon-toolchain/arm64-android:v0.3 bash -lc '
+    cd /workspace
+    cmake --preset arm64-android-snapdragon-release -B build-snapdragon   # GGML_HEXAGON=ON + GGML_OPENCL=ON
+    cmake --build build-snapdragon --target llama-pi0-bench htp-v79 -j$(nproc)
+  '
+```
+Produces `libggml-hexagon.so` (host) + `libggml-htp-v79.so` (the DSP skel).
+
+### Deploy + run
+```bash
+DST=/data/local/tmp/pi0
+adb push build-snapdragon/bin/*.so                                  $DST/lib/
+adb push build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-v79.so  $DST/lib/
+adb push build-snapdragon/bin/llama-pi0-bench                       $DST/bin/
+
+adb shell "cd $DST && LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib \
+  ./bin/llama-pi0-bench --backend HTP0 --kv-type f16 -n 5 --warmup 1 \
+     -m gguf/pi0-q4 --image data/cam_left_wrist.jpg,data/cam_right_wrist.jpg,data/cam_high.jpg"
+```
+- `--backend HTP0` selects the NPU (prefix + diffusion offload; vision → OpenCL).
+- `ADSP_LIBRARY_PATH` must point at the dir holding `libggml-htp-v79.so`.
+- **Keep flash attention ON** (default): on the NPU the HMX flash kernel is **~4× faster**
+  than standard attention for PI0's short KV cache — do **not** set `PI0_NO_FLASH_ATTN=1` here.
+- Gotcha: for a `GPUOpenCL` / `cpu` run in a build that also links Hexagon, set
+  `GGML_HEXAGON_NDEV=0` to skip HTP session-open (a lingering session otherwise aborts the run).
+
+### Performance (SM8750 · Adreno 830 / Hexagon v79 · pi0-q4, kv f16)
+| phase | tuned OpenCL (Adreno) | **HTP0 (NPU)** | speedup |
+|---|---|---|---|
+| Prefix (PaliGemma-2B, 773 tok) | ~1520 ms | **~460 ms** | **~3.3×** |
+| Diffusion (10 flow-matching steps) | ~420 ms  | **~310 ms** | ~1.4× |
+| Vision (SigLIP, stays on GPU) | ~620 ms | ~620 ms | — |
+
+The NPU wins big on the prefix — the FFN/proj GEMMs hit **8–15 TFLOPS** on HMX. Diffusion
+is closer to parity (small seq=51 underutilizes HMX + per-op FastRPC overhead).
+
+### Per-op NPU profiling
+Set `GGML_HEXAGON_PROFILE=1` to dump `htp_profiling.csv` (one row per DSP op:
+`phase / op / names / dims / types / usec / cycles`). Aggregate by op × output-shape to
+see where NPU time goes and which ops are HMX-bound vs memory/host-bound.
+
+### Notes
+- Activations are **f32** on purpose: Gemma's residual stream overflows f16's ±65504
+  range (f16 activations → garbage). The matmul already downconverts the *post-norm*
+  activation to f16 internally where it is safe.
+- The Gemma FFN GeGLU (`gelu(gate)*up`) is fused into one HTP `glu_geglu` op (−8% prefix).
