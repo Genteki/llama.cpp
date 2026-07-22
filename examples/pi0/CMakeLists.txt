@@ -16,6 +16,13 @@ install(TARGETS ${TARGET_BENCH} RUNTIME)
 target_link_libraries(${TARGET_BENCH} PRIVATE pi0-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_BENCH} PRIVATE cxx_std_17)
 
+# Heterogeneous phase-pipeline scheduling test: Vision(GPU/OpenCL) || Prefix+FM(NPU/HTP).
+set(TARGET_PIPELINE llama-pi0-pipeline)
+add_executable(${TARGET_PIPELINE} pi0-pipeline.cpp)
+install(TARGETS ${TARGET_PIPELINE} RUNTIME)
+target_link_libraries(${TARGET_PIPELINE} PRIVATE pi0-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_PIPELINE} PRIVATE cxx_std_17)
+
 # Standalone attention-GEMM microbenchmark (batched vs collapsed, prefix shapes).
 set(TARGET_ATTN_BENCH llama-pi0-attn-bench)
 add_executable(${TARGET_ATTN_BENCH} pi0-attn-bench.cpp)
