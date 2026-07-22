@@ -302,9 +302,13 @@ int main(int argc, char ** argv) {
     };
 
     // NPU stage: Prefix pass + PI0_NUM_STEPS Euler flow-matching steps. Touches
-    // ONLY the pi0 backend + session. Returns the final action mean/rms.
-    auto run_npu = [&](const float * embd, int plen, double & mean, double & rms) -> bool {
+    // ONLY the pi0 backend + session. Returns the final action mean/rms, and
+    // optionally the split prefix / flow-matching wall times.
+    auto run_npu = [&](const float * embd, int plen, double & mean, double & rms,
+                       double * prefix_ms = nullptr, double * fm_ms = nullptr) -> bool {
+        int64_t tp0 = ggml_time_us();
         if (!run_paligemma_prefix(model, session, backend, embd, plen)) return false;
+        int64_t tp1 = ggml_time_us();
         std::mt19937 rng(42);
         std::normal_distribution<float> normal(0.0f, 1.0f);
         std::vector<float> x_t(PI0_ACTION_DIM * PI0_ACTION_HORIZON);
@@ -317,6 +321,9 @@ int main(int argc, char ** argv) {
             }
             for (size_t i = 0; i < x_t.size(); i++) x_t[i] += dt * v_t[i];
         }
+        int64_t tp2 = ggml_time_us();
+        if (prefix_ms) *prefix_ms = us_to_ms(tp1 - tp0);
+        if (fm_ms)     *fm_ms     = us_to_ms(tp2 - tp1);
         action_stats(x_t, mean, rms);
         return true;
     };
@@ -371,49 +378,68 @@ int main(int argc, char ** argv) {
         printf("             action mean=%.6f rms=%.6f\n", ref_mean, ref_rms);
     }
 
-    // ---- Concurrent probe: isolate shared-DRAM contention ----
+    // ---- Concurrent probe: PER-PHASE shared-DRAM contention ----
+    // Each phase is timed (a) solo and (b) while the OTHER engine is kept
+    // continuously busy by a background thread, so the phase experiences
+    // contention for its whole duration. degrade% = (concurrent - solo)/solo.
     if (do_probe) {
         std::vector<float> embd0;
-        if (encode_frame(embd0) < 0) return 1; // fixed NPU input
+        if (encode_frame(embd0) < 0) return 1;          // fixed NPU input
+        const int R = std::max(1, pp.probe_reps);
 
-        double sum_gpu = 0, sum_npu = 0, sum_conc = 0;
-        for (int r = 0; r < pp.probe_reps; r++) {
-            std::vector<float> scratch;
-            double mn, rs;
-
-            int64_t g0 = ggml_time_us();
-            if (encode_frame(scratch) < 0) return 1;
-            double t_gpu = us_to_ms(ggml_time_us() - g0);
-
-            int64_t n0 = ggml_time_us();
-            if (!run_npu(embd0.data(), prefix_len, mn, rs)) return 1;
-            double t_npu = us_to_ms(ggml_time_us() - n0);
-
-            // Both engines at once, on independent inputs (no data dependency).
-            std::atomic<bool> gpu_ok{true}, npu_ok{true};
-            int64_t c0 = ggml_time_us();
-            std::thread ta([&] { std::vector<float> s; if (encode_frame(s) < 0) gpu_ok = false; });
-            std::thread tb([&] { double m2, r2; if (!run_npu(embd0.data(), prefix_len, m2, r2)) npu_ok = false; });
-            ta.join(); tb.join();
-            double t_conc = us_to_ms(ggml_time_us() - c0);
-            if (!gpu_ok || !npu_ok) { LOG_ERR("probe concurrent stage failed\n"); return 1; }
-
-            sum_gpu += t_gpu; sum_npu += t_npu; sum_conc += t_conc;
+        // solo baselines
+        double s_vis = 0, s_pre = 0, s_fm = 0;
+        for (int r = 0; r < R; r++) {
+            std::vector<float> s; double mn, rs, pm, fm;
+            int64_t t = ggml_time_us();
+            if (encode_frame(s) < 0) return 1;
+            s_vis += us_to_ms(ggml_time_us() - t);
+            if (!run_npu(embd0.data(), prefix_len, mn, rs, &pm, &fm)) return 1;
+            s_pre += pm; s_fm += fm;
         }
-        double a_gpu = sum_gpu / pp.probe_reps;
-        double a_npu = sum_npu / pp.probe_reps;
-        double a_conc = sum_conc / pp.probe_reps;
-        double ideal = std::max(a_gpu, a_npu);                 // perfect overlap
-        double serial = a_gpu + a_npu;                         // zero overlap
-        double efficiency = serial / a_conc;                   // 1.0 = serialized, serial/ideal = perfect
-        double best_eff   = serial / ideal;
-        double penalty = a_conc - ideal;
+        s_vis /= R; s_pre /= R; s_fm /= R;
 
-        printf("\n[probe] solo Vision(GPU) %.1f ms | solo Prefix+FM(NPU) %.1f ms\n", a_gpu, a_npu);
-        printf("        concurrent %.1f ms  (serial %.1f, ideal-overlap %.1f)\n", a_conc, serial, ideal);
-        printf("        overlap efficiency %.2fx of serial (%.2fx = perfect)\n", efficiency, best_eff);
-        printf("        contention penalty %.1f ms above ideal overlap (%.0f%% of ideal)\n",
-               penalty, 100.0 * penalty / ideal);
+        // Vision (GPU) while the NPU is kept busy in the background.
+        double c_vis = 0;
+        {
+            std::atomic<bool> stop{false}, ok{true};
+            std::thread npu_load([&] {
+                while (!stop) { double m, rr; if (!run_npu(embd0.data(), prefix_len, m, rr)) { ok = false; break; } }
+            });
+            for (int r = 0; r < R; r++) {
+                std::vector<float> s;
+                int64_t t = ggml_time_us();
+                if (encode_frame(s) < 0) { stop = true; npu_load.join(); return 1; }
+                c_vis += us_to_ms(ggml_time_us() - t);
+            }
+            stop = true; npu_load.join();
+            if (!ok) { LOG_ERR("probe NPU background failed\n"); return 1; }
+        }
+        c_vis /= R;
+
+        // Prefix + Flow-Matching (NPU) while the GPU (vision) is kept busy.
+        double c_pre = 0, c_fm = 0;
+        {
+            std::atomic<bool> stop{false}, ok{true};
+            std::thread gpu_load([&] {
+                std::vector<float> s; while (!stop) { if (encode_frame(s) < 0) { ok = false; break; } }
+            });
+            for (int r = 0; r < R; r++) {
+                double mn, rs, pm, fm;
+                if (!run_npu(embd0.data(), prefix_len, mn, rs, &pm, &fm)) { stop = true; gpu_load.join(); return 1; }
+                c_pre += pm; c_fm += fm;
+            }
+            stop = true; gpu_load.join();
+            if (!ok) { LOG_ERR("probe GPU background failed\n"); return 1; }
+        }
+        c_pre /= R; c_fm /= R;
+
+        auto deg = [](double solo, double conc) { return solo > 0 ? 100.0 * (conc - solo) / solo : 0.0; };
+        printf("\n[probe] per-phase shared-DRAM contention (solo vs concurrent, avg of %d)\n", R);
+        printf("  %-18s %9s %11s %10s\n", "phase (device)", "solo ms", "concur ms", "degrade%");
+        printf("  %-18s %9.1f %11.1f %9.1f%%\n", "Vision   (GPU)",   s_vis, c_vis, deg(s_vis, c_vis));
+        printf("  %-18s %9.1f %11.1f %9.1f%%\n", "Prefix   (NPU)",   s_pre, c_pre, deg(s_pre, c_pre));
+        printf("  %-18s %9.1f %11.1f %9.1f%%\n", "FlowMatch(NPU)",   s_fm,  c_fm,  deg(s_fm,  c_fm));
     }
 
     // ---- Full 2-thread pipeline over a stream of frames ----
