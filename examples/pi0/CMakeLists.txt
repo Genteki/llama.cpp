@@ -23,6 +23,13 @@ install(TARGETS ${TARGET_PIPELINE} RUNTIME)
 target_link_libraries(${TARGET_PIPELINE} PRIVATE pi0-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_PIPELINE} PRIVATE cxx_std_17)
 
+# Operator-level GPU/NPU co-execution (contention) matrix: g_ij / h_ij.
+set(TARGET_OPMAT llama-pi0-opmat-bench)
+add_executable(${TARGET_OPMAT} pi0-opmat-bench.cpp)
+install(TARGETS ${TARGET_OPMAT} RUNTIME)
+target_link_libraries(${TARGET_OPMAT} PRIVATE pi0-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_OPMAT} PRIVATE cxx_std_17)
+
 # Standalone attention-GEMM microbenchmark (batched vs collapsed, prefix shapes).
 set(TARGET_ATTN_BENCH llama-pi0-attn-bench)
 add_executable(${TARGET_ATTN_BENCH} pi0-attn-bench.cpp)
